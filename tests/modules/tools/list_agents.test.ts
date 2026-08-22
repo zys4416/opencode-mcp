@@ -2,10 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeMcpServer } from "../../../src/test-utils/fake-mcp-server.js";
 
 const createOpencodeClientMock = vi.fn();
+const getUsageLimitsMock = vi.fn();
 
 vi.mock("@opencode-ai/sdk", () => ({
   createOpencodeClient: (...args: unknown[]) => createOpencodeClientMock(...args),
 }));
+vi.mock("../../../src/modules/shared/usage-limits.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../../../src/modules/shared/usage-limits.js")>();
+  return { ...actual, getUsageLimits: getUsageLimitsMock };
+});
 
 const { registerOpencodeListAgents } = await import("../../../src/modules/tools/list_agents.js");
 const { registerServer, killAllServers } = await import(
@@ -34,6 +40,8 @@ describe("opencode_list_agents", () => {
   beforeEach(() => {
     killAllServers();
     createOpencodeClientMock.mockReset();
+    getUsageLimitsMock.mockReset();
+    getUsageLimitsMock.mockResolvedValue(null);
   });
 
   it("returns not_found for an unknown server", async () => {
@@ -133,11 +141,15 @@ describe("opencode_list_agents", () => {
             },
             models: {
               defaults: { anthropic: "claude-sonnet-5" },
+              quota_snapshot: null,
               providers: [
                 {
                   provider: "anthropic",
                   name: "Anthropic",
-                  models: ["claude-sonnet-5", "claude-opus-4-8"],
+                  models: [
+                    { id: "claude-sonnet-5", quota: null },
+                    { id: "claude-opus-4-8", quota: null },
+                  ],
                 },
               ],
             },
@@ -145,6 +157,55 @@ describe("opencode_list_agents", () => {
         },
       ],
     });
+  });
+
+  it("joins the cached quota table onto live model ids", async () => {
+    registerServer({ serverId: "srv-1", baseUrl: "http://127.0.0.1:4096", close: vi.fn() });
+    getUsageLimitsMock.mockResolvedValue({
+      source: "https://opencode.ai/docs/es/go/#l\u00edmites-de-uso",
+      fetchedAt: "2026-08-21T10:00:00.000Z",
+      spendBudget: { fiveHours: "$12", weekly: "$30", monthly: "$60" },
+      models: [
+        { model: "MiMo-V2.5", perFiveHours: 30_100, perWeek: 75_200, perMonth: 150_400 },
+        { model: "GLM-5.2", perFiveHours: 880, perWeek: 2_150, perMonth: 4_300 },
+        { model: "Grok 4.5", perFiveHours: 120, perWeek: 300, perMonth: 600 },
+        { model: "Ox Alpha Free", perFiveHours: null, perWeek: null, perMonth: null },
+      ],
+    });
+    mockClient({
+      providers: {
+        data: {
+          providers: [
+            {
+              id: "opencode-go",
+              name: "OpenCode Go",
+              models: { "mimo-v2.5": {}, "glm-5.2": {}, "grok-4.5": {}, "ox-alpha-free": {} },
+            },
+            { id: "opencode", name: "OpenCode", models: { "big-pickle": {} } },
+          ],
+          default: {},
+        },
+      },
+    });
+    const fake = createFakeMcpServer();
+    registerOpencodeListAgents(fake.server);
+    const handler = fake.getHandler();
+
+    const result = await handler({ server_id: "srv-1" });
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload.models.quota_snapshot).toEqual({
+      source: "https://opencode.ai/docs/es/go/#l\u00edmites-de-uso",
+      checked: "2026-08-21",
+    });
+    expect(payload.models.providers[0].models).toEqual([
+      { id: "mimo-v2.5", quota: { per_5h: 30_100, tier: "high-volume" } },
+      { id: "glm-5.2", quota: { per_5h: 880, tier: "balanced" } },
+      { id: "grok-4.5", quota: { per_5h: 120, tier: "scarce" } },
+      { id: "ox-alpha-free", quota: { per_5h: null, tier: "unlisted" } },
+    ]);
+    // Not an OpenCode Go model: no row in the docs table.
+    expect(payload.models.providers[1].models).toEqual([{ id: "big-pickle", quota: null }]);
   });
 
   it("defaults to empty collections when data is missing", async () => {
@@ -163,7 +224,7 @@ describe("opencode_list_agents", () => {
           text: JSON.stringify({
             server_id: "srv-1",
             agents: { native: [], custom: [] },
-            models: { defaults: {}, providers: [] },
+            models: { defaults: {}, quota_snapshot: null, providers: [] },
           }),
         },
       ],

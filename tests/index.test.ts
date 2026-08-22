@@ -20,6 +20,13 @@ vi.mock("../src/modules/shared/server-registry.js", () => ({
 vi.mock("../src/modules/tools/index.js", () => ({
   registerTools: registerToolsMock,
 }));
+// Instructions hit the network on a cold cache; the entrypoint only needs a string.
+vi.mock("../src/modules/shared/instructions.js", () => ({
+  createDelegateTaskInstructions: vi.fn().mockResolvedValue("instructions"),
+}));
+
+/** Let main()'s async chain (instructions -> server -> connect) settle. */
+const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 describe("index entrypoint", () => {
   const handlers = new Map<string, (...args: unknown[]) => void>();
@@ -52,9 +59,7 @@ describe("index entrypoint", () => {
 
   it("registers tools, connects the transport, and wires shutdown handlers", async () => {
     await import("../src/index.js");
-    // main() is async; flush microtasks
-    await Promise.resolve();
-    await Promise.resolve();
+    await flush();
 
     expect(registerToolsMock).toHaveBeenCalledOnce();
     expect(connectMock).toHaveBeenCalledOnce();
@@ -66,7 +71,7 @@ describe("index entrypoint", () => {
 
   it("shuts down tracked servers and exits on SIGINT", async () => {
     await import("../src/index.js");
-    await Promise.resolve();
+    await flush();
 
     handlers.get("SIGINT")?.("SIGINT");
 
@@ -76,7 +81,7 @@ describe("index entrypoint", () => {
 
   it("calls killAllServers as a safety net on process exit", async () => {
     await import("../src/index.js");
-    await Promise.resolve();
+    await flush();
 
     handlers.get("exit")?.();
 
@@ -87,9 +92,7 @@ describe("index entrypoint", () => {
     connectMock.mockRejectedValueOnce(new Error("connect failed"));
 
     await import("../src/index.js");
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await flush();
 
     expect(consoleErrorSpy).toHaveBeenCalledWith("Fatal error in main():", expect.any(Error));
     expect(processExitSpy).toHaveBeenCalledWith(1);

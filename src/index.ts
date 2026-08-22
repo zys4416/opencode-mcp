@@ -1,24 +1,27 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { DELEGATE_TASK_INSTRUCTIONS } from "./modules/shared/instructions.js";
+import { createDelegateTaskInstructions } from "./modules/shared/instructions.js";
 import { killAllServers } from "./modules/shared/server-registry.js";
 import { registerTools } from "./modules/tools/index.js";
 
 // Create server instance
-const server = new McpServer(
-  {
-    name: "opencode-mcp",
-    version: "1.0.0",
-    title: "OpenCode MCP",
-    description:
-      "MCP server that drives an OpenCode instance and delegates work asynchronously to its agents",
-    websiteUrl: "https://opencode-mcp.alejandrotechnology.com",
-  },
-  {
-    instructions: DELEGATE_TASK_INSTRUCTIONS,
-  },
-);
+async function createServer() {
+  const instructions = await createDelegateTaskInstructions();
+  return new McpServer(
+    {
+      name: "opencode-mcp",
+      version: "1.0.0",
+      title: "OpenCode MCP",
+      description:
+        "MCP server that drives an OpenCode instance and delegates work asynchronously to its agents",
+      websiteUrl: "https://opencode-mcp.alejandrotechnology.com",
+    },
+    {
+      instructions,
+    },
+  );
+}
 
 function shutdown(signal: NodeJS.Signals) {
   console.error(`Received ${signal}, stopping tracked OpenCode servers...`);
@@ -35,6 +38,7 @@ process.on("SIGTERM", shutdown);
 process.on("exit", killAllServers);
 
 async function main() {
+  const server = await createServer();
   registerTools(server);
   const transport = new StdioServerTransport();
   await server.connect(transport);
