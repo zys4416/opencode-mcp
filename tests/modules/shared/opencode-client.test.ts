@@ -7,12 +7,16 @@ vi.mock("@opencode-ai/sdk", () => ({
 }));
 
 import {
+  assistantEntries,
   buildProgress,
   clientForServer,
   clientForTask,
   deriveTaskStatus,
+  EMPTY_TURN_MESSAGE,
+  hasWork,
   lastAssistantEntry,
   PENDING_STALL_MS,
+  sessionParts,
 } from "../../../src/modules/shared/opencode-client.js";
 import { killAllServers, registerServer } from "../../../src/modules/shared/server-registry.js";
 import { registerTask, removeTask } from "../../../src/modules/shared/task-registry.js";
@@ -187,7 +191,61 @@ describe("deriveTaskStatus", () => {
     expect(result).toEqual({ task_id: "task-1", status: "failed", error: "OOPS" });
   });
 
-  it("returns completed when the assistant entry has completed time", async () => {
+  it("returns completed when the assistant entry finished and produced work", async () => {
+    const client = {
+      session: {
+        status: vi.fn().mockResolvedValue({ data: {} }),
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            {
+              info: { role: "assistant", time: { completed: 123 } },
+              parts: [{ type: "text", text: "all done" }],
+            },
+          ],
+        }),
+      },
+    };
+    const result = await deriveTaskStatus(client as never, "s1", "task-1");
+    expect(result).toEqual({ task_id: "task-1", status: "completed", progress: undefined });
+  });
+
+  it("includes side-effect evidence on the completed path when includeProgress is true", async () => {
+    const client = {
+      session: {
+        status: vi.fn().mockResolvedValue({ data: {} }),
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            {
+              info: { role: "assistant", time: { completed: 123 } },
+              parts: [
+                { type: "text", text: "done" },
+                {
+                  type: "tool",
+                  tool: "write",
+                  state: { status: "completed", input: { filePath: "src/a.ts" } },
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    };
+    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
+      includeProgress: true,
+    });
+    expect(result).toEqual({
+      task_id: "task-1",
+      status: "completed",
+      progress: {
+        text_snippet: "done",
+        tool_calls_completed: 1,
+        mutating_tool_calls: 1,
+        files_touched: ["src/a.ts"],
+      },
+    });
+  });
+
+  it("returns empty, not completed, when the finished turn produced nothing", async () => {
     const client = {
       session: {
         status: vi.fn().mockResolvedValue({ data: {} }),
@@ -197,7 +255,42 @@ describe("deriveTaskStatus", () => {
       },
     };
     const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "completed" });
+    expect(result).toEqual({
+      task_id: "task-1",
+      status: "empty",
+      error: EMPTY_TURN_MESSAGE,
+      progress: undefined,
+    });
+  });
+
+  it("treats a whitespace-only finished turn as empty and can report its progress", async () => {
+    const client = {
+      session: {
+        status: vi.fn().mockResolvedValue({ data: {} }),
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            {
+              info: { role: "assistant", time: { completed: 123 } },
+              parts: [{ type: "text", text: "   \n  " }],
+            },
+          ],
+        }),
+      },
+    };
+    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
+      includeProgress: true,
+    });
+    expect(result).toEqual({
+      task_id: "task-1",
+      status: "empty",
+      error: EMPTY_TURN_MESSAGE,
+      progress: {
+        text_snippet: "   \n  ",
+        tool_calls_completed: 0,
+        mutating_tool_calls: 0,
+        files_touched: [],
+      },
+    });
   });
 
   it("returns running when the assistant entry has no completed time and no error", async () => {
@@ -243,7 +336,12 @@ describe("deriveTaskStatus", () => {
     expect(result).toEqual({
       task_id: "task-1",
       status: "running",
-      progress: { text_snippet: "hello", tool_calls_completed: 0 },
+      progress: {
+        text_snippet: "hello",
+        tool_calls_completed: 0,
+        mutating_tool_calls: 0,
+        files_touched: [],
+      },
     });
   });
 
@@ -280,12 +378,159 @@ describe("deriveTaskStatus", () => {
     expect(result).toEqual({
       task_id: "task-1",
       status: "running",
-      progress: { text_snippet: "still working", tool_calls_completed: 0 },
+      progress: {
+        text_snippet: "still working",
+        tool_calls_completed: 0,
+        mutating_tool_calls: 0,
+        files_touched: [],
+      },
     });
   });
 });
 
+describe("buildProgress across a whole session", () => {
+  it("reads the snippet from the latest turn and the evidence from every turn", () => {
+    const earlier = [
+      { type: "tool", tool: "edit", state: { status: "completed", input: { filePath: "a.ts" } } },
+    ];
+    const latest = [{ type: "text", text: "DONE" }];
+    const progress = buildProgress(latest as never, [...earlier, ...latest] as never);
+    expect(progress.text_snippet).toBe("DONE");
+    expect(progress.mutating_tool_calls).toBe(1);
+    expect(progress.files_touched).toEqual(["a.ts"]);
+  });
+
+  it("still reports the in-flight tool from the latest turn only", () => {
+    const earlier = [
+      { type: "tool", tool: "read", state: { status: "completed", input: { filePath: "a.ts" } } },
+    ];
+    const latest = [{ type: "tool", tool: "write", state: { status: "running", input: {} } }];
+    const progress = buildProgress(latest as never, [...earlier, ...latest] as never);
+    expect(progress.current_tool).toBe("write");
+    expect(progress.current_tool_status).toBe("running");
+    expect(progress.tool_calls_completed).toBe(1);
+  });
+
+  it("defaults the session view to the latest turn when no session parts are given", () => {
+    const parts = [
+      { type: "tool", tool: "write", state: { status: "completed", input: { filePath: "a.ts" } } },
+    ];
+    expect(buildProgress(parts as never).files_touched).toEqual(["a.ts"]);
+  });
+});
+
+describe("sessionParts", () => {
+  it("flattens every assistant entry's parts, oldest first", () => {
+    const entries = [
+      { info: {}, parts: [{ type: "text", text: "one" }] },
+      { info: {}, parts: [{ type: "text", text: "two" }] },
+    ];
+    expect(sessionParts(entries as never)).toEqual([
+      { type: "text", text: "one" },
+      { type: "text", text: "two" },
+    ]);
+  });
+});
+
+describe("assistantEntries", () => {
+  it("returns every assistant message in order, skipping user messages", async () => {
+    const client = {
+      session: {
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            { info: { role: "user" }, parts: [{ type: "text", text: "go" }] },
+            { info: { role: "assistant", time: { completed: 1 } }, parts: [] },
+            { info: { role: "assistant", time: { completed: 2 } }, parts: [] },
+          ],
+        }),
+      },
+    };
+    const entries = await assistantEntries(client as never, "s1");
+    expect(entries).toHaveLength(2);
+    expect(entries[0].info.time.completed).toBe(1);
+    expect(entries[1].info.time.completed).toBe(2);
+  });
+
+  it("returns an empty array when the session has no messages", async () => {
+    const client = { session: { messages: vi.fn().mockResolvedValue({ data: undefined }) } };
+    expect(await assistantEntries(client as never, "s1")).toEqual([]);
+  });
+});
+
+describe("hasWork", () => {
+  it("is false for no parts at all", () => {
+    expect(hasWork([])).toBe(false);
+  });
+
+  it("is false for text parts that are only whitespace", () => {
+    expect(hasWork([{ type: "text", text: "  \n\t " }] as never)).toBe(false);
+  });
+
+  it("is true for text parts with real content", () => {
+    expect(hasWork([{ type: "text", text: "ok" }] as never)).toBe(true);
+  });
+
+  it("is true for a tool part even with no text, whatever its status", () => {
+    expect(hasWork([{ type: "tool", tool: "write", state: { status: "error" } }] as never)).toBe(
+      true,
+    );
+  });
+
+  it("ignores part types that are neither text nor tool", () => {
+    expect(hasWork([{ type: "step-start" }] as never)).toBe(false);
+  });
+});
+
 describe("buildProgress", () => {
+  it("counts mutating tool calls and collects the files they touched", () => {
+    const parts = [
+      { type: "tool", tool: "read", state: { status: "completed", input: { filePath: "a.ts" } } },
+      { type: "tool", tool: "write", state: { status: "completed", input: { filePath: "b.ts" } } },
+      { type: "tool", tool: "edit", state: { status: "completed", input: { filePath: "c.ts" } } },
+      {
+        type: "tool",
+        tool: "apply_patch",
+        state: { status: "completed", input: { filePath: "d.ts" } },
+      },
+      { type: "tool", tool: "bash", state: { status: "completed", input: { command: "ls" } } },
+    ];
+    const progress = buildProgress(parts as never);
+    expect(progress.tool_calls_completed).toBe(5);
+    // `read` is not mutating; `bash` is, but names no path.
+    expect(progress.mutating_tool_calls).toBe(4);
+    expect(progress.files_touched).toEqual(["b.ts", "c.ts", "d.ts"]);
+  });
+
+  it("deduplicates repeated file paths", () => {
+    const parts = [
+      { type: "tool", tool: "write", state: { status: "completed", input: { filePath: "a.ts" } } },
+      { type: "tool", tool: "edit", state: { status: "completed", input: { filePath: "a.ts" } } },
+    ];
+    const progress = buildProgress(parts as never);
+    expect(progress.mutating_tool_calls).toBe(2);
+    expect(progress.files_touched).toEqual(["a.ts"]);
+  });
+
+  it("ignores a mutating call whose filePath is missing, empty, or not a string", () => {
+    const parts = [
+      { type: "tool", tool: "write", state: { status: "completed", input: {} } },
+      { type: "tool", tool: "write", state: { status: "completed", input: { filePath: "" } } },
+      { type: "tool", tool: "edit", state: { status: "completed", input: { filePath: 42 } } },
+    ];
+    const progress = buildProgress(parts as never);
+    expect(progress.mutating_tool_calls).toBe(3);
+    expect(progress.files_touched).toEqual([]);
+  });
+
+  it("does not count a mutating call that has not completed", () => {
+    const parts = [
+      { type: "tool", tool: "write", state: { status: "running", input: { filePath: "a.ts" } } },
+    ];
+    const progress = buildProgress(parts as never);
+    expect(progress.mutating_tool_calls).toBe(0);
+    expect(progress.files_touched).toEqual([]);
+  });
+
   it("concatenates text parts and truncates the snippet to the last ~500 chars", () => {
     const longText = "a".repeat(300) + "b".repeat(300);
     const parts = [
@@ -322,11 +567,21 @@ describe("buildProgress", () => {
   it("ignores part types that are neither text nor tool", () => {
     const parts = [{ type: "step-start" }];
     const progress = buildProgress(parts as never);
-    expect(progress).toEqual({ text_snippet: "", tool_calls_completed: 0 });
+    expect(progress).toEqual({
+      text_snippet: "",
+      tool_calls_completed: 0,
+      mutating_tool_calls: 0,
+      files_touched: [],
+    });
   });
 
   it("returns an empty snippet when there are no parts", () => {
     const progress = buildProgress([]);
-    expect(progress).toEqual({ text_snippet: "", tool_calls_completed: 0 });
+    expect(progress).toEqual({
+      text_snippet: "",
+      tool_calls_completed: 0,
+      mutating_tool_calls: 0,
+      files_touched: [],
+    });
   });
 });
