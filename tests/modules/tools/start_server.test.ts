@@ -2,13 +2,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeMcpServer } from "../../../src/test-utils/fake-mcp-server.js";
 
 const createOpencodeServerMock = vi.fn();
+const createOpencodeClientMock = vi.fn();
 
 vi.mock("@opencode-ai/sdk", () => ({
   createOpencodeServer: (...args: unknown[]) => createOpencodeServerMock(...args),
+  createOpencodeClient: (...args: unknown[]) => createOpencodeClientMock(...args),
 }));
 
 vi.mock("node:crypto", () => ({
   randomUUID: () => "generated-uuid",
+}));
+
+const getExternalDirectoryPolicyMock = vi.fn();
+const buildServerConfigMock = vi.fn();
+const startPermissionResponderMock = vi.fn();
+
+vi.mock("../../../src/modules/shared/permissions.js", () => ({
+  getExternalDirectoryPolicy: () => getExternalDirectoryPolicyMock(),
+  buildServerConfig: (...args: unknown[]) => buildServerConfigMock(...args),
+  startPermissionResponder: (...args: unknown[]) => startPermissionResponderMock(...args),
 }));
 
 const { registerOpencodeStartServer } = await import("../../../src/modules/tools/start_server.js");
@@ -19,10 +31,19 @@ const { getServer, killAllServers } = await import(
 describe("opencode_start_server", () => {
   beforeEach(() => {
     createOpencodeServerMock.mockReset();
+    createOpencodeClientMock.mockReset();
+    getExternalDirectoryPolicyMock.mockReset();
+    buildServerConfigMock.mockReset();
+    startPermissionResponderMock.mockReset();
     killAllServers();
+
+    getExternalDirectoryPolicyMock.mockReturnValue("read-only");
+    buildServerConfigMock.mockReturnValue({ permission: { external_directory: "ask" } });
+    startPermissionResponderMock.mockReturnValue({ stop: vi.fn(), done: Promise.resolve() });
+    createOpencodeClientMock.mockReturnValue({ fake: "client" });
   });
 
-  it("starts a server, registers it, and returns its id", async () => {
+  it("starts a server with the permission config, registers it, and returns its id", async () => {
     const close = vi.fn();
     createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close });
     const fake = createFakeMcpServer();
@@ -31,9 +52,11 @@ describe("opencode_start_server", () => {
 
     const result = await handler({ port: undefined });
 
+    expect(buildServerConfigMock).toHaveBeenCalledWith("read-only");
     expect(createOpencodeServerMock).toHaveBeenCalledWith({
       hostname: "127.0.0.1",
       port: 4096,
+      config: { permission: { external_directory: "ask" } },
     });
     expect(result).toEqual({
       content: [
@@ -43,14 +66,58 @@ describe("opencode_start_server", () => {
             server_id: "generated-uuid",
             baseUrl: "http://127.0.0.1:4096",
             status: "running",
+            permissions: { external_directory: "read-only", auto_approved: true },
           }),
         },
       ],
     });
-    expect(getServer("generated-uuid")).toEqual({
+    expect(getServer("generated-uuid")).toMatchObject({
       serverId: "generated-uuid",
       baseUrl: "http://127.0.0.1:4096",
-      close,
+    });
+  });
+
+  it("starts a permission responder bound to the new server's url", async () => {
+    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close: vi.fn() });
+    const fake = createFakeMcpServer();
+    registerOpencodeStartServer(fake.server);
+
+    await fake.getHandler()({ port: undefined });
+
+    expect(createOpencodeClientMock).toHaveBeenCalledWith({ baseUrl: "http://127.0.0.1:4096" });
+    expect(startPermissionResponderMock).toHaveBeenCalledWith(
+      { fake: "client" },
+      { policy: "read-only" },
+    );
+  });
+
+  it("stops the responder when the registered server is closed", async () => {
+    const close = vi.fn();
+    const stop = vi.fn();
+    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close });
+    startPermissionResponderMock.mockReturnValue({ stop, done: Promise.resolve() });
+    const fake = createFakeMcpServer();
+    registerOpencodeStartServer(fake.server);
+
+    await fake.getHandler()({ port: undefined });
+    killAllServers();
+
+    expect(stop).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("reports the resolved policy back to the caller", async () => {
+    getExternalDirectoryPolicyMock.mockReturnValue("deny");
+    buildServerConfigMock.mockReturnValue({ permission: { external_directory: "deny" } });
+    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close: vi.fn() });
+    const fake = createFakeMcpServer();
+    registerOpencodeStartServer(fake.server);
+
+    const result = await fake.getHandler()({ port: undefined });
+
+    expect(JSON.parse(result.content[0].text).permissions).toEqual({
+      external_directory: "deny",
+      auto_approved: true,
     });
   });
 
@@ -65,6 +132,7 @@ describe("opencode_start_server", () => {
     expect(createOpencodeServerMock).toHaveBeenCalledWith({
       hostname: "127.0.0.1",
       port: 5000,
+      config: { permission: { external_directory: "ask" } },
     });
   });
 
