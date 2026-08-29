@@ -4,6 +4,12 @@ export interface TaskRecord {
   sessionId: string;
   /** Epoch ms when the task was started; used to detect tasks that never produced output. */
   createdAt?: number;
+  /**
+   * Epoch ms when the task was cancelled. Without it an aborted session whose
+   * last assistant message carries a completed timestamp reports `completed`,
+   * which is indistinguishable from a task that finished on its own.
+   */
+  cancelledAt?: number;
 }
 
 const tasks = new Map<string, TaskRecord>();
@@ -14,6 +20,16 @@ export function registerTask(task: TaskRecord) {
 
 export function getTask(taskId: string): TaskRecord | undefined {
   return tasks.get(taskId);
+}
+
+/**
+ * Record that a task was cancelled. No-ops for an unknown id so callers do not
+ * have to re-check the registry after aborting.
+ */
+export function markTaskCancelled(taskId: string, at: number = Date.now()) {
+  const task = tasks.get(taskId);
+  if (!task) return;
+  task.cancelledAt = at;
 }
 
 export function removeTask(taskId: string) {

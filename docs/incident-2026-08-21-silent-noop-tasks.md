@@ -4,7 +4,7 @@
 - **Version:** opencode-mcp `1.1.5` (`cc12272`)
 - **Reporter:** Claude Code (Opus 5), acting as orchestrator
 - **Severity:** High — a caller cannot distinguish a successful task from a task that never ran
-- **Status:** F1 / F2 / F5 fixed on 2026-08-28 (see §9). F4 still open.
+- **Status:** Resolved 2026-08-28 (see §9). F1, F2, F4 and F5 all fixed.
 
 ---
 
@@ -339,7 +339,7 @@ Treat `{"status": "completed", "result": ""}` as a **failure** until R1 lands.
 - F5 is fixed: a permission responder auto-answers every permission request in headless mode; reads outside the working directory are allowed, writes outside the working directory are rejected, so tasks no longer wedge on an interactive approval prompt.
 - F2 is closed as a side effect of F1: an idle session whose assistant message exists but is empty now reports `empty`, which was the case the `PENDING_STALL_MS` guard could not reach.
 - Side-effect evidence is collected across **every** assistant turn in the session, not just the last one. An agent's edits land in earlier turns while the final turn is usually just "DONE", so reading evidence off the last message reported `files_touched: []` for a task that had rewritten the workspace. This was caught only by end-to-end runs against a live server; the unit tests passed throughout.
-- F4 (cancellation leaves no trace in the task registry) is **not** addressed.
+- F4 is fixed: `TaskRecord` gained `cancelledAt`, `cancel_task` stamps it after a successful abort (and only then), and `deriveTaskStatus` / `get_task_result` check it before anything else and report `cancelled`. A cancelled task still returns whatever it produced before the abort, including `files_touched`, because a killed task may well have written files.
 
 Verified end to end against opencode `1.18.18`, replaying both incident rounds:
 
@@ -348,3 +348,4 @@ Verified end to end against opencode `1.18.18`, replaying both incident rounds:
 | Round 1 — read a brief at an absolute path outside the cwd | hung indefinitely, `tool_calls_completed: 0` | `completed` in 15s, `mutating_tool_calls: 0`, `files_touched: []` |
 | Round 2 — rewrite files in a subdirectory | `completed` with `result: ""`, 0 files written | `completed`, `mutating_tool_calls: 2`, `files_touched` lists both files, both changed on disk |
 | Write outside the cwd | n/a | rejected, tool state `error`, file not created |
+| Cancel a task mid-flight | reported `completed` after the abort | `cancelled` from both `get_task_status` and `get_task_result` |

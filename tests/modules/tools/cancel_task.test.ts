@@ -8,10 +8,14 @@ vi.mock("../../../src/modules/shared/opencode-client.js", () => ({
 }));
 
 const { registerOpencodeCancelTask } = await import("../../../src/modules/tools/cancel_task.js");
+const { getTask, registerTask, removeTask } = await import(
+  "../../../src/modules/shared/task-registry.js"
+);
 
 describe("opencode_cancel_task", () => {
   beforeEach(() => {
     clientForTaskMock.mockReset();
+    removeTask("task-1");
   });
 
   it("returns task_not_found when the task cannot be resolved", async () => {
@@ -55,6 +59,36 @@ describe("opencode_cancel_task", () => {
         },
       ],
     });
+  });
+
+  it("records cancelledAt on the registry record", async () => {
+    registerTask({ taskId: "task-1", serverId: "srv-1", sessionId: "session-1" });
+    clientForTaskMock.mockReturnValue({
+      client: { session: { abort: vi.fn().mockResolvedValue({}) } },
+      sessionId: "session-1",
+    });
+    const fake = createFakeMcpServer();
+    registerOpencodeCancelTask(fake.server);
+
+    await fake.getHandler()({ task_id: "task-1" });
+
+    expect(getTask("task-1")?.cancelledAt).toBeTypeOf("number");
+    removeTask("task-1");
+  });
+
+  it("does not record cancelledAt when the abort itself fails", async () => {
+    registerTask({ taskId: "task-1", serverId: "srv-1", sessionId: "session-1" });
+    clientForTaskMock.mockReturnValue({
+      client: { session: { abort: vi.fn().mockRejectedValue(new Error("nope")) } },
+      sessionId: "session-1",
+    });
+    const fake = createFakeMcpServer();
+    registerOpencodeCancelTask(fake.server);
+
+    await fake.getHandler()({ task_id: "task-1" });
+
+    expect(getTask("task-1")?.cancelledAt).toBeUndefined();
+    removeTask("task-1");
   });
 
   it("returns an error result when the SDK throws an Error", async () => {

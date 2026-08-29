@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { EMPTY_TURN_MESSAGE } from "../../../src/modules/shared/opencode-client.js";
+import {
+  CANCELLED_TASK_MESSAGE,
+  EMPTY_TURN_MESSAGE,
+} from "../../../src/modules/shared/opencode-client.js";
+import { registerTask, removeTask } from "../../../src/modules/shared/task-registry.js";
 import { createFakeMcpServer } from "../../../src/test-utils/fake-mcp-server.js";
 
 const clientForTaskMock = vi.fn();
@@ -22,6 +26,7 @@ describe("opencode_get_task_result", () => {
   beforeEach(() => {
     clientForTaskMock.mockReset();
     assistantEntriesMock.mockReset();
+    removeTask("task-1");
   });
 
   it("returns not_found when the task cannot be resolved", async () => {
@@ -241,6 +246,58 @@ describe("opencode_get_task_result", () => {
     expect(payload.progress.text_snippet).toBe("DONE");
     expect(payload.progress.mutating_tool_calls).toBe(2);
     expect(payload.progress.files_touched).toEqual(["e2e/alpha.ts", "e2e/beta.ts"]);
+  });
+
+  it("returns cancelled with the partial output for an aborted task", async () => {
+    registerTask({
+      taskId: "task-1",
+      serverId: "srv",
+      sessionId: "s1",
+      cancelledAt: Date.now(),
+    });
+    clientForTaskMock.mockReturnValue({ client: {}, sessionId: "s1" });
+    assistantEntriesMock.mockResolvedValue([
+      {
+        info: { time: { completed: 1 } },
+        parts: [
+          {
+            type: "tool",
+            tool: "write",
+            state: { status: "completed", input: { filePath: "a.ts" } },
+          },
+        ],
+      },
+      { info: { time: { completed: 2 } }, parts: [{ type: "text", text: "got halfway" }] },
+    ]);
+    const fake = createFakeMcpServer();
+    registerOpencodeGetTaskResult(fake.server);
+
+    const payload = JSON.parse((await fake.getHandler()({ task_id: "task-1" })).content[0].text);
+
+    expect(payload.status).toBe("cancelled");
+    expect(payload.result).toBe("got halfway");
+    expect(payload.message).toBe(CANCELLED_TASK_MESSAGE);
+    expect(payload.progress.files_touched).toEqual(["a.ts"]);
+    removeTask("task-1");
+  });
+
+  it("returns a null result for a task cancelled before it produced anything", async () => {
+    registerTask({
+      taskId: "task-1",
+      serverId: "srv",
+      sessionId: "s1",
+      cancelledAt: Date.now(),
+    });
+    clientForTaskMock.mockReturnValue({ client: {}, sessionId: "s1" });
+    assistantEntriesMock.mockResolvedValue([]);
+    const fake = createFakeMcpServer();
+    registerOpencodeGetTaskResult(fake.server);
+
+    const payload = JSON.parse((await fake.getHandler()({ task_id: "task-1" })).content[0].text);
+
+    expect(payload.status).toBe("cancelled");
+    expect(payload.result).toBeNull();
+    removeTask("task-1");
   });
 
   it("returns an error result when the client throws an Error", async () => {

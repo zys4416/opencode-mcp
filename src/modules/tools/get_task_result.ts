@@ -1,14 +1,25 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { Part } from "@opencode-ai/sdk";
 import { z } from "zod";
 import { jsonError, jsonResult } from "../shared/mcp-result.js";
 import {
   assistantEntries,
   buildProgress,
+  CANCELLED_TASK_MESSAGE,
   clientForTask,
   EMPTY_TURN_MESSAGE,
   hasWork,
   sessionParts,
 } from "../shared/opencode-client.js";
+import { getTask } from "../shared/task-registry.js";
+
+/** Concatenate every TextPart in a turn, in order. */
+function joinText(parts: Part[]): string {
+  return parts
+    .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
 
 export function registerOpencodeGetTaskResult(server: McpServer) {
   server.registerTool(
@@ -29,6 +40,20 @@ export function registerOpencodeGetTaskResult(server: McpServer) {
       try {
         const entries = await assistantEntries(client, sessionId);
         const entry = entries.at(-1);
+
+        // An aborted session keeps its completed timestamp, so without this a
+        // deliberately killed task reads as a normal success.
+        if (getTask(task_id)?.cancelledAt !== undefined) {
+          const text = joinText(entry?.parts ?? []);
+          return jsonResult({
+            task_id,
+            status: "cancelled",
+            result: text === "" ? null : text,
+            message: CANCELLED_TASK_MESSAGE,
+            progress: buildProgress(entry?.parts ?? [], sessionParts(entries)),
+          });
+        }
+
         if (!entry) {
           return jsonResult({ task_id, status: "pending", result: null });
         }
@@ -59,12 +84,12 @@ export function registerOpencodeGetTaskResult(server: McpServer) {
           });
         }
 
-        const text = entry.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("");
-
-        return jsonResult({ task_id, status: "completed", result: text, progress });
+        return jsonResult({
+          task_id,
+          status: "completed",
+          result: joinText(entry.parts),
+          progress,
+        });
       } catch (error) {
         return jsonError({
           task_id,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   getTask,
+  markTaskCancelled,
   registerTask,
   removeTask,
   type TaskRecord,
@@ -31,5 +32,26 @@ describe("task-registry", () => {
     registerTask(task);
     removeTask("task-2");
     expect(getTask("task-2")).toBeUndefined();
+  });
+});
+
+describe("markTaskCancelled", () => {
+  it("stamps the record with the given time", () => {
+    registerTask({ taskId: "t-cancel", serverId: "srv", sessionId: "s" });
+    markTaskCancelled("t-cancel", 1234);
+    expect(getTask("t-cancel")?.cancelledAt).toBe(1234);
+    removeTask("t-cancel");
+  });
+
+  it("defaults to now when no time is given", () => {
+    registerTask({ taskId: "t-cancel", serverId: "srv", sessionId: "s" });
+    markTaskCancelled("t-cancel");
+    expect(getTask("t-cancel")?.cancelledAt).toBeTypeOf("number");
+    removeTask("t-cancel");
+  });
+
+  it("is a no-op for an unknown task id", () => {
+    expect(() => markTaskCancelled("nope")).not.toThrow();
+    expect(getTask("nope")).toBeUndefined();
   });
 });

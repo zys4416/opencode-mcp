@@ -9,6 +9,7 @@ vi.mock("@opencode-ai/sdk", () => ({
 import {
   assistantEntries,
   buildProgress,
+  CANCELLED_TASK_MESSAGE,
   clientForServer,
   clientForTask,
   deriveTaskStatus,
@@ -129,6 +130,123 @@ describe("deriveTaskStatus", () => {
     };
     const result = await deriveTaskStatus(client as never, "s1", "task-1");
     expect(result).toEqual({ task_id: "task-1", status: "running" });
+  });
+
+  it("returns cancelled for a cancelled task, even though the session says busy", async () => {
+    registerTask({
+      taskId: "task-killed",
+      serverId: "srv",
+      sessionId: "s1",
+      cancelledAt: Date.now(),
+    });
+    const client = {
+      session: { status: vi.fn().mockResolvedValue({ data: { s1: { type: "busy" } } }) },
+    };
+
+    const result = await deriveTaskStatus(client as never, "s1", "task-killed");
+
+    expect(result).toEqual({
+      task_id: "task-killed",
+      status: "cancelled",
+      error: CANCELLED_TASK_MESSAGE,
+      progress: undefined,
+    });
+    // Cancellation short-circuits before any session lookup.
+    expect(client.session.status).not.toHaveBeenCalled();
+    removeTask("task-killed");
+  });
+
+  it("returns cancelled instead of completed for an aborted finished session", async () => {
+    registerTask({
+      taskId: "task-killed",
+      serverId: "srv",
+      sessionId: "s1",
+      cancelledAt: Date.now(),
+    });
+    const client = {
+      session: {
+        status: vi.fn().mockResolvedValue({ data: {} }),
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            {
+              info: { role: "assistant", time: { completed: 123 } },
+              parts: [{ type: "text", text: "half done" }],
+            },
+          ],
+        }),
+      },
+    };
+
+    const result = await deriveTaskStatus(client as never, "s1", "task-killed");
+
+    expect(result.status).toBe("cancelled");
+    removeTask("task-killed");
+  });
+
+  it("reports what a cancelled task managed to touch before the abort", async () => {
+    registerTask({
+      taskId: "task-killed",
+      serverId: "srv",
+      sessionId: "s1",
+      cancelledAt: Date.now(),
+    });
+    const client = {
+      session: {
+        status: vi.fn(),
+        messages: vi.fn().mockResolvedValue({
+          data: [
+            {
+              info: { role: "assistant", time: { completed: 1 } },
+              parts: [
+                {
+                  type: "tool",
+                  tool: "write",
+                  state: { status: "completed", input: { filePath: "a.ts" } },
+                },
+              ],
+            },
+            { info: { role: "assistant", time: {} }, parts: [{ type: "text", text: "partial" }] },
+          ],
+        }),
+      },
+    };
+
+    const result = await deriveTaskStatus(client as never, "s1", "task-killed", {
+      includeProgress: true,
+    });
+
+    expect(result.status).toBe("cancelled");
+    expect(result.progress).toEqual({
+      text_snippet: "partial",
+      tool_calls_completed: 1,
+      mutating_tool_calls: 1,
+      files_touched: ["a.ts"],
+    });
+    removeTask("task-killed");
+  });
+
+  it("omits progress for a cancelled task with no assistant output", async () => {
+    registerTask({
+      taskId: "task-killed",
+      serverId: "srv",
+      sessionId: "s1",
+      cancelledAt: Date.now(),
+    });
+    const client = {
+      session: { status: vi.fn(), messages: vi.fn().mockResolvedValue({ data: [] }) },
+    };
+
+    const result = await deriveTaskStatus(client as never, "s1", "task-killed", {
+      includeProgress: true,
+    });
+
+    expect(result).toEqual({
+      task_id: "task-killed",
+      status: "cancelled",
+      error: CANCELLED_TASK_MESSAGE,
+      progress: undefined,
+    });
+    removeTask("task-killed");
   });
 
   it("returns pending when not busy and there is no assistant entry", async () => {

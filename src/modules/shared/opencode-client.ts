@@ -58,7 +58,7 @@ export async function lastAssistantEntry(
   return (await assistantEntries(client, sessionId)).at(-1);
 }
 
-export type TaskStatus = "pending" | "running" | "completed" | "failed" | "empty";
+export type TaskStatus = "pending" | "running" | "completed" | "failed" | "empty" | "cancelled";
 
 export interface TaskProgress {
   /** Last ~500 chars of concatenated TextPart text from the last assistant message. */
@@ -176,6 +176,10 @@ export function buildProgress(latest: Part[], whole: Part[] = latest): TaskProgr
   };
 }
 
+/** Message returned alongside the `cancelled` status, shared by status and result. */
+export const CANCELLED_TASK_MESSAGE =
+  "the task was cancelled via opencode_cancel_task; any output below is whatever the agent produced before the abort";
+
 /** Message returned alongside the `empty` status, shared by status and result. */
 export const EMPTY_TURN_MESSAGE =
   "the session finished without producing any text or tool calls; the prompt was likely rejected or the turn was aborted";
@@ -196,6 +200,19 @@ export async function deriveTaskStatus(
   options?: DeriveTaskStatusOptions,
 ): Promise<TaskStatusResult> {
   const includeProgress = options?.includeProgress ?? false;
+
+  // Cancellation wins over everything else: an aborted session keeps its
+  // completed timestamp, so any later check would call it `completed`.
+  if (getTask(taskId)?.cancelledAt !== undefined) {
+    const entries = includeProgress ? await assistantEntries(client, sessionId) : [];
+    const latest = entries.at(-1);
+    return {
+      task_id: taskId,
+      status: "cancelled",
+      error: CANCELLED_TASK_MESSAGE,
+      progress: latest ? buildProgress(latest.parts, sessionParts(entries)) : undefined,
+    };
+  }
 
   // The status map only lists sessions that are actively working.
   const statusRes = await client.session.status();
