@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { jsonError, jsonResult } from "../shared/mcp-result.js";
-import { clientForServer } from "../shared/opencode-client.js";
+import { getServer } from "../shared/server-registry.js";
 import { registerTask } from "../shared/task-registry.js";
 
 /** Parse a "providerID/modelID" string into the shape the SDK expects. */
@@ -17,7 +17,7 @@ export function registerOpencodeStartTask(server: McpServer) {
     "opencode_start_task",
     {
       description:
-        "Delegate a task to an OpenCode agent: create a session and start the prompt without waiting for it to finish",
+        "Delegate a task using OpenCode's configured default model. Omit model unless the user explicitly requests model selection. Returns immediately after prompt admission.",
       inputSchema: {
         server_id: z.string().describe("Id of the server instance to run the task on"),
         prompt: z.string().describe("Prompt/instructions for the agent"),
@@ -31,16 +31,17 @@ export function registerOpencodeStartTask(server: McpServer) {
           .string()
           .optional()
           .describe(
-            "Model override as 'providerID/modelID', copied verbatim from opencode_list_agents output — never guess or construct the id from a model's display name. Overrides the agent's pre-assigned model for this task only. An unknown model is rejected with status 'unknown_model' and the list of available models",
+            "Omit by default to use the selected agent's configured model or OpenCode's default model. Only set when the user explicitly requests model selection. If authorized, copy an exact providerID/modelID from opencode_list_agents; do not guess or copy the default merely to fill this field.",
           ),
       },
     },
     async ({ server_id, prompt, agent, model }) => {
-      const client = clientForServer(server_id);
-      if (!client) {
+      const server = getServer(server_id);
+      if (!server) {
         return jsonError({ server_id, status: "server_not_found" });
       }
 
+      const client = server.client;
       let parsedModel: { providerID: string; modelID: string } | undefined;
       if (model !== undefined) {
         parsedModel = parseModel(model);
@@ -56,47 +57,56 @@ export function registerOpencodeStartTask(server: McpServer) {
       try {
         if (parsedModel) {
           const requested = parsedModel;
-          // Validate against the server's real provider/model catalog: promptAsync is
-          // fire-and-forget, so an unknown model would otherwise fail silently and the
-          // task would look stuck forever. Skip validation if the catalog is unavailable.
-          const providersRes = await client.config.providers();
-          const providers = providersRes.data?.providers;
-          if (providers) {
-            const provider = providers.find((p) => p.id === requested.providerID);
-            if (!provider || !(requested.modelID in provider.models)) {
-              return jsonError({
-                server_id,
-                status: "unknown_model",
-                model,
-                message:
-                  "model is not available on this server; copy an exact 'providerID/modelID' from opencode_list_agents (or from available_models below) instead of guessing",
-                available_models: providers.flatMap((p) =>
-                  Object.keys(p.models).map((m) => `${p.id}/${m}`),
-                ),
-              });
-            }
+          const modelsRes = await client.model.list({
+            location: { directory: server.directory },
+          });
+          const models = modelsRes.data.filter((model) => model.enabled);
+          if (
+            !models.some(
+              (model) =>
+                model.providerID === requested.providerID && model.id === requested.modelID,
+            )
+          ) {
+            return jsonError({
+              server_id,
+              status: "unknown_model",
+              model,
+              message:
+                "model is not available; copy a providerID/modelID from opencode_list_agents",
+              available_models: models.map((model) => `${model.providerID}/${model.id}`),
+            });
           }
         }
 
-        const created = await client.session.create({ body: { title: prompt.slice(0, 60) } });
-        const sessionId = created.data?.id;
+        const created = await client.session.create({
+          title: prompt.slice(0, 60),
+          location: { directory: server.directory },
+          agent,
+          model: parsedModel
+            ? { providerID: parsedModel.providerID, id: parsedModel.modelID }
+            : undefined,
+        });
+        const sessionId = created.id;
         if (!sessionId) {
           return jsonError({ server_id, status: "error", message: "failed to create session" });
         }
 
-        // Fire-and-forget: promptAsync returns as soon as the prompt is accepted,
-        // the agent keeps working in the background. Poll with get_task_status.
-        await client.session.promptAsync({
-          path: { id: sessionId },
-          body: {
-            parts: [{ type: "text", text: prompt }],
-            ...(agent ? { agent } : {}),
-            ...(parsedModel ? { model: parsedModel } : {}),
-          },
-        });
-
         const taskId = randomUUID();
-        registerTask({ taskId, serverId: server_id, sessionId, createdAt: Date.now() });
+        const inputId = `msg_${randomUUID()}`;
+        // Register ownership before submitting, so early permission events are handled.
+        registerTask({ taskId, serverId: server_id, sessionId, inputId, createdAt: Date.now() });
+        try {
+          await client.session.prompt({ sessionID: sessionId, id: inputId, text: prompt });
+        } catch {
+          // The request may have been admitted before a connection dropped. Keep its
+          // identity available; never automatically retry a potentially executing prompt.
+          return jsonError({
+            task_id: taskId,
+            session_id: sessionId,
+            status: "error",
+            message: "Prompt submission failed; inspect this task before retrying",
+          });
+        }
 
         return jsonResult({
           task_id: taskId,

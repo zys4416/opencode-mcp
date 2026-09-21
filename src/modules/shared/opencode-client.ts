@@ -1,23 +1,28 @@
-import {
-  type AssistantMessage,
-  createOpencodeClient,
-  type OpencodeClient,
-  type Part,
-} from "@opencode-ai/sdk";
+import type { OpenCodeClient, SessionMessageAssistant, SessionMessageInfo } from "@opencode/client";
 import { getServer } from "./server-registry.js";
 import { getTask } from "./task-registry.js";
 
-/** Build an HTTP client for a tracked server, or undefined if the id is unknown. */
-export function clientForServer(serverId: string): OpencodeClient | undefined {
+export type Part =
+  | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
+  | {
+      type: "tool";
+      callID: string;
+      tool: string;
+      state: {
+        status: "pending" | "running" | "completed" | "error";
+        input: Record<string, unknown>;
+      };
+    };
+
+export function clientForServer(serverId: string): OpenCodeClient | undefined {
   const server = getServer(serverId);
-  if (!server) return undefined;
-  return createOpencodeClient({ baseUrl: server.baseUrl });
+  return server?.client;
 }
 
-/** Resolve a task to its server client and session id, or undefined if unknown. */
 export function clientForTask(
   taskId: string,
-): { client: OpencodeClient; sessionId: string } | undefined {
+): { client: OpenCodeClient; sessionId: string } | undefined {
   const task = getTask(taskId);
   if (!task) return undefined;
   const client = clientForServer(task.serverId);
@@ -26,33 +31,63 @@ export function clientForTask(
 }
 
 export interface AssistantEntry {
-  info: AssistantMessage;
+  info: SessionMessageAssistant;
   parts: Part[];
 }
 
-/** Fetch every assistant message (with its parts) for a session, oldest first. */
-export async function assistantEntries(
-  client: OpencodeClient,
+export async function messages(
+  client: OpenCodeClient,
   sessionId: string,
-): Promise<AssistantEntry[]> {
-  const res = await client.session.messages({ path: { id: sessionId } });
-  const entries: AssistantEntry[] = [];
-  for (const message of res.data ?? []) {
-    if (message.info.role === "assistant") {
-      entries.push({ info: message.info, parts: message.parts });
-    }
-  }
-  return entries;
+): Promise<SessionMessageInfo[]> {
+  const result: SessionMessageInfo[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await client.message.list({
+      sessionID: sessionId,
+      limit: 100,
+      ...(cursor ? { cursor } : { order: "asc" }),
+    });
+    result.push(...page.data);
+    cursor = page.cursor.next ?? undefined;
+    if (cursor && seen.has(cursor)) throw new Error("OpenCode returned a repeated message cursor");
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return result;
 }
 
-/** Every part the assistant emitted across the whole session, oldest first. */
+export function assistantEntry(info: SessionMessageAssistant): AssistantEntry {
+  return {
+    info,
+    parts: info.content.map((part): Part => {
+      if (part.type !== "tool") return { type: part.type, text: part.text };
+      return {
+        type: "tool",
+        callID: part.id,
+        tool: part.name,
+        state: {
+          status: part.state.status === "streaming" ? "pending" : part.state.status,
+          input: part.state.status === "streaming" ? {} : part.state.input,
+        },
+      };
+    }),
+  };
+}
+
+export async function assistantEntries(
+  client: OpenCodeClient,
+  sessionId: string,
+): Promise<AssistantEntry[]> {
+  return (await messages(client, sessionId))
+    .filter((message): message is SessionMessageAssistant => message.type === "assistant")
+    .map(assistantEntry);
+}
+
 export function sessionParts(entries: AssistantEntry[]): Part[] {
   return entries.flatMap((entry) => entry.parts);
 }
-
-/** Fetch the most recent assistant message (with its parts) for a session. */
 export async function lastAssistantEntry(
-  client: OpencodeClient,
+  client: OpenCodeClient,
   sessionId: string,
 ): Promise<AssistantEntry | undefined> {
   return (await assistantEntries(client, sessionId)).at(-1);
@@ -84,13 +119,17 @@ export interface TaskStatusResult {
 
 const TEXT_SNIPPET_MAX_LENGTH = 500;
 
-/**
- * Tools that can change the workspace. Verified against the live tool catalog
- * (`client.tool.ids()` on opencode 1.18.18): the patch tool is `apply_patch`,
- * and there is no `list` tool. `task` delegates to a subagent, which can write
- * through any of the others.
- */
-const MUTATING_TOOLS = new Set(["write", "edit", "apply_patch", "bash", "task"]);
+/** Native v2 mutation tools plus aliases emitted by compatibility plugins. */
+const MUTATING_TOOLS = new Set([
+  "write",
+  "edit",
+  "patch",
+  "apply_patch",
+  "shell",
+  "bash",
+  "subagent",
+  "task",
+]);
 
 /**
  * Whether an assistant turn actually produced anything.
@@ -116,12 +155,11 @@ export const PENDING_STALL_MS = 15_000;
 /**
  * The workspace path a completed tool call wrote to, if it names one.
  *
- * Verified against a live server: `write` and `edit` carry the path as
- * `state.input.filePath`; `bash` carries only `command`, so it counts as
- * mutating without contributing a path.
+ * Native write/edit inputs use `path`; compatibility plugins may use `filePath`.
+ * Shell operations count as mutations but do not always expose affected paths.
  */
 function touchedFilePath(input: { [key: string]: unknown }): string | undefined {
-  const filePath = input.filePath;
+  const filePath = input.path ?? input.filePath;
   return typeof filePath === "string" && filePath !== "" ? filePath : undefined;
 }
 
@@ -188,90 +226,92 @@ export interface DeriveTaskStatusOptions {
   includeProgress?: boolean;
 }
 
-/**
- * Derive the current status of a task by inspecting session busy state and
- * the last assistant message. Shared by opencode_get_task_status and
- * opencode_wait_for_task so both use identical status derivation.
- */
+/** Correlate completion to this prompt, never to a previous completed turn. */
+export async function taskSnapshot(client: OpenCodeClient, sessionId: string, taskId: string) {
+  const task = getTask(taskId);
+  const server = task && getServer(task.serverId);
+  if (server?.permissionError) throw new Error(server.permissionError);
+  const timeline = await messages(client, sessionId);
+  const boundary = timeline.findIndex((message) => message.id === task?.inputId);
+  const current = boundary < 0 ? [] : timeline.slice(boundary + 1);
+  const entries = current
+    .filter((message): message is SessionMessageAssistant => message.type === "assistant")
+    .map(assistantEntry);
+  const latest = entries.at(-1);
+  const progress = buildProgress(latest?.parts ?? [], sessionParts(entries));
+  const result =
+    latest?.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("") || null;
+  if (task?.cancelledAt !== undefined)
+    return { status: "cancelled" as const, error: CANCELLED_TASK_MESSAGE, progress, result };
+  // Fetch active last: an assistant turn completing is not the whole execution completing.
+  const info = await client.session.get({ sessionID: sessionId });
+  const active = await client.session.active();
+  if (active[sessionId]) return { status: "running" as const, progress, result };
+  // Permission rejection can terminate the current step without a session idle
+  // projection. Only use errors from this input, and only after execution stops.
+  if (latest?.info.error)
+    return {
+      status: latest.info.error.type === "aborted" ? ("cancelled" as const) : ("failed" as const),
+      error: latest.info.error.message,
+      progress,
+      result,
+    };
+  const idle = current.filter((message) => message.type === "idle").at(-1);
+  const input = timeline[boundary];
+  const finishedAfterInput =
+    input !== undefined &&
+    info.time.idle !== undefined &&
+    info.time.idle >= input.time.created &&
+    info.time.idle > (task?.previousIdleAt ?? 0);
+  const outcome = idle?.outcome ?? (finishedAfterInput ? info.outcome : undefined);
+  if (boundary < 0 || !outcome) {
+    if (
+      task?.createdAt !== undefined &&
+      Date.now() - task.createdAt > PENDING_STALL_MS &&
+      entries.length === 0
+    ) {
+      return {
+        status: "failed" as const,
+        error: "task input was not executed; inspect the OpenCode session inbox",
+        progress,
+        result,
+      };
+    }
+    return { status: "pending" as const, progress, result };
+  }
+  if (outcome === "failed")
+    return {
+      status: "failed" as const,
+      error: "OpenCode execution failed",
+      progress,
+      result,
+    };
+  if (outcome === "interrupted")
+    return {
+      status: "cancelled" as const,
+      error: "OpenCode execution was interrupted",
+      progress,
+      result,
+    };
+  if (!hasWork(sessionParts(entries)))
+    return { status: "empty" as const, error: EMPTY_TURN_MESSAGE, progress, result };
+  return { status: "completed" as const, progress, result };
+}
+
 export async function deriveTaskStatus(
-  client: OpencodeClient,
+  client: OpenCodeClient,
   sessionId: string,
   taskId: string,
   options?: DeriveTaskStatusOptions,
 ): Promise<TaskStatusResult> {
-  const includeProgress = options?.includeProgress ?? false;
-
-  // Cancellation wins over everything else: an aborted session keeps its
-  // completed timestamp, so any later check would call it `completed`.
-  if (getTask(taskId)?.cancelledAt !== undefined) {
-    const entries = includeProgress ? await assistantEntries(client, sessionId) : [];
-    const latest = entries.at(-1);
-    return {
-      task_id: taskId,
-      status: "cancelled",
-      error: CANCELLED_TASK_MESSAGE,
-      progress: latest ? buildProgress(latest.parts, sessionParts(entries)) : undefined,
-    };
-  }
-
-  // The status map only lists sessions that are actively working.
-  const statusRes = await client.session.status();
-  const sessionStatus = statusRes.data?.[sessionId];
-  if (sessionStatus?.type === "busy" || sessionStatus?.type === "retry") {
-    if (includeProgress) {
-      const entries = await assistantEntries(client, sessionId);
-      const latest = entries.at(-1);
-      return {
-        task_id: taskId,
-        status: "running",
-        progress: latest ? buildProgress(latest.parts, sessionParts(entries)) : undefined,
-      };
-    }
-    return { task_id: taskId, status: "running" };
-  }
-
-  // Not busy: inspect the last assistant message to tell pending from done.
-  const entries = await assistantEntries(client, sessionId);
-  const entry = entries.at(-1);
-  if (!entry) {
-    // Idle session with no assistant output: either the prompt was just accepted,
-    // or it was silently rejected (fire-and-forget) and will never run. Past the
-    // stall window, report failure instead of leaving the task pending forever.
-    const task = getTask(taskId);
-    if (task?.createdAt !== undefined && Date.now() - task.createdAt > PENDING_STALL_MS) {
-      return {
-        task_id: taskId,
-        status: "failed",
-        error:
-          "task produced no output after starting; the prompt was likely rejected (e.g. invalid model or agent)",
-      };
-    }
-    return { task_id: taskId, status: "pending" };
-  }
-  if (entry.info.error) {
-    return { task_id: taskId, status: "failed", error: entry.info.error.name };
-  }
-  if (entry.info.time.completed) {
-    // A completed timestamp is not a work check. An assistant turn that ended
-    // with no text and no tool calls did nothing, and reporting that as
-    // `completed` is what lets a caller build on top of unchanged files.
-    if (!hasWork(entry.parts)) {
-      return {
-        task_id: taskId,
-        status: "empty",
-        error: EMPTY_TURN_MESSAGE,
-        progress: includeProgress ? buildProgress(entry.parts, sessionParts(entries)) : undefined,
-      };
-    }
-    return {
-      task_id: taskId,
-      status: "completed",
-      progress: includeProgress ? buildProgress(entry.parts, sessionParts(entries)) : undefined,
-    };
-  }
+  const snapshot = await taskSnapshot(client, sessionId, taskId);
   return {
     task_id: taskId,
-    status: "running",
-    progress: includeProgress ? buildProgress(entry.parts, sessionParts(entries)) : undefined,
+    status: snapshot.status,
+    error: snapshot.error,
+    ...(options?.includeProgress ? { progress: snapshot.progress } : {}),
   };
 }

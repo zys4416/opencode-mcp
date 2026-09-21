@@ -1,177 +1,75 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakeMcpServer } from "../../../src/test-utils/fake-mcp-server.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import { killAllServers } from "../../../src/modules/shared/server-registry.js";
+import { getTask, registerTask, removeTask } from "../../../src/modules/shared/task-registry.js";
+import { registerOpencodeContinueTask } from "../../../src/modules/tools/continue_task.js";
+import { fixture, handler } from "../../helpers/v2.js";
 
-const clientForTaskMock = vi.fn();
-
-vi.mock("../../../src/modules/shared/opencode-client.js", () => ({
-  clientForTask: (...args: unknown[]) => clientForTaskMock(...args),
-}));
-
-const { registerOpencodeContinueTask } = await import(
-  "../../../src/modules/tools/continue_task.js"
-);
-
-describe("opencode_continue_task", () => {
-  beforeEach(() => {
-    clientForTaskMock.mockReset();
+const run = handler(registerOpencodeContinueTask);
+beforeEach(() => {
+  killAllServers();
+  removeTask("task_test");
+});
+function setup() {
+  const f = fixture();
+  registerTask({
+    taskId: "task_test",
+    serverId: "srv_test",
+    sessionId: "ses_test",
+    cancelledAt: 1,
   });
-
-  it("returns task_not_found when the task cannot be resolved", async () => {
-    clientForTaskMock.mockReturnValue(undefined);
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "missing", prompt: "keep going" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        { type: "text", text: JSON.stringify({ task_id: "missing", status: "task_not_found" }) },
-      ],
-    });
+  return f;
+}
+describe("continue v2 task", () => {
+  it("rejects unresolved tasks and malformed models", async () => {
+    expect((await run({ task_id: "missing", prompt: "hi" })).status).toBe("task_not_found");
+    setup();
+    for (const model of ["bad", "/model", "test/"])
+      expect((await run({ task_id: "task_test", prompt: "hi", model })).status).toBe(
+        "invalid_model",
+      );
   });
-
-  it("returns invalid_model when model is malformed", async () => {
-    clientForTaskMock.mockReturnValue({
-      client: { session: { promptAsync: vi.fn() } },
-      sessionId: "s1",
+  it("changes model and agent, resets cancellation and records the next input", async () => {
+    const { fetch } = setup();
+    const result = await run({
+      task_id: "task_test",
+      prompt: "next",
+      model: "test/model",
+      agent: "plan",
     });
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1", prompt: "hi", model: "no-slash" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            task_id: "task-1",
-            status: "invalid_model",
-            message: "model must be in 'providerID/modelID' format",
-          }),
-        },
-      ],
+    expect(result.status).toBe("pending");
+    expect(getTask("task_test")).toMatchObject({
+      inputId: expect.stringMatching(/^msg_/),
+      createdAt: expect.any(Number),
     });
+    expect(getTask("task_test")?.cancelledAt).toBeUndefined();
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith("/model"))).toBe(true);
   });
-
-  it("returns invalid_model when the slash is at position 0 or end", async () => {
-    clientForTaskMock.mockReturnValue({
-      client: { session: { promptAsync: vi.fn() } },
-      sessionId: "s1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1", prompt: "hi", model: "/trailing" });
-    expect(result).toMatchObject({ isError: true });
-
-    const result2 = await handler({ task_id: "task-1", prompt: "hi", model: "leading/" });
-    expect(result2).toMatchObject({ isError: true });
+  it("continues without overrides", async () => {
+    setup();
+    expect((await run({ task_id: "task_test", prompt: "next" })).status).toBe("pending");
   });
-
-  it("sends the follow-up prompt to the same session with agent and model", async () => {
-    const promptAsync = vi.fn().mockResolvedValue({});
-    clientForTaskMock.mockReturnValue({
-      client: { session: { promptAsync } },
-      sessionId: "session-1",
+  it.each([true, false])("rejects active or queued sessions (%s)", async (active) => {
+    const { routes } = setup();
+    routes.set(active ? "GET /api/session/active" : "GET /api/session/ses_test/inbox", {
+      data: active ? { ses_test: { type: "running" } } : [{ id: "pending" }],
     });
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({
-      task_id: "task-1",
-      prompt: "keep going",
-      agent: "build",
-      model: "anthropic/claude-sonnet-4",
-    });
-
-    expect(promptAsync).toHaveBeenCalledWith({
-      path: { id: "session-1" },
-      body: {
-        parts: [{ type: "text", text: "keep going" }],
-        agent: "build",
-        model: { providerID: "anthropic", modelID: "claude-sonnet-4" },
-      },
-    });
-    expect(result).toEqual({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            task_id: "task-1",
-            session_id: "session-1",
-            status: "pending",
-          }),
-        },
-      ],
-    });
+    expect((await run({ task_id: "task_test", prompt: "next" })).isError).toBe(true);
   });
-
-  it("sends the follow-up prompt without optional agent or model fields", async () => {
-    const promptAsync = vi.fn().mockResolvedValue({});
-    clientForTaskMock.mockReturnValue({
-      client: { session: { promptAsync } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    await handler({ task_id: "task-1", prompt: "keep going" });
-
-    expect(promptAsync).toHaveBeenCalledWith({
-      path: { id: "session-1" },
-      body: { parts: [{ type: "text", text: "keep going" }] },
-    });
+  it.each([401, 400])("reports request errors (%s)", async (status) => {
+    const { routes } = setup();
+    routes.set(
+      "POST /api/session/ses_test/prompt",
+      status === 401 ? 401 : Response.json({ message: "invalid" }, { status }),
+    );
+    expect((await run({ task_id: "task_test", prompt: "next" })).isError).toBe(true);
   });
-
-  it("returns an error result when the SDK throws an Error", async () => {
-    clientForTaskMock.mockReturnValue({
-      client: { session: { promptAsync: vi.fn().mockRejectedValue(new Error("db down")) } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1", prompt: "hi" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ task_id: "task-1", status: "error", message: "db down" }),
-        },
-      ],
-    });
-  });
-
-  it("returns an error result when the SDK throws a non-Error value", async () => {
-    clientForTaskMock.mockReturnValue({
-      client: { session: { promptAsync: vi.fn().mockRejectedValue("weird") } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeContinueTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1", prompt: "hi" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ task_id: "task-1", status: "error", message: "weird" }),
-        },
-      ],
-    });
-  });
+});
+it("serializes concurrent follow-ups", async () => {
+  setup();
+  const first = run({ task_id: "task_test", prompt: "first" });
+  expect((await run({ task_id: "task_test", prompt: "second" })).message).toBe(
+    "Another task update is in progress",
+  );
+  await first;
+  expect(getTask("task_test")?.mutating).toBe(false);
 });

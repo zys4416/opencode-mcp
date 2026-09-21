@@ -12,6 +12,8 @@ function makeInstance(overrides: Partial<OpencodeServerInstance> = {}): Opencode
     serverId: "srv-1",
     baseUrl: "http://127.0.0.1:4096",
     close: vi.fn(),
+    client: {} as never,
+    directory: "/project",
     ...overrides,
   };
 }

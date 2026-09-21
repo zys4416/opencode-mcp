@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { jsonError, jsonResult } from "../shared/mcp-result.js";
 import { clientForTask } from "../shared/opencode-client.js";
+import { getTask, resumeTask } from "../shared/task-registry.js";
 
 /** Parse a "providerID/modelID" string into the shape the SDK expects. */
 function parseModel(model: string): { providerID: string; modelID: string } | undefined {
@@ -14,7 +16,8 @@ export function registerOpencodeContinueTask(server: McpServer) {
   server.registerTool(
     "opencode_continue_task",
     {
-      description: "Send a follow-up prompt to an existing delegated task's session",
+      description:
+        "Send a follow-up prompt while retaining the session's current model. Omit model unless the user explicitly requests model selection.",
       inputSchema: {
         task_id: z
           .string()
@@ -30,13 +33,14 @@ export function registerOpencodeContinueTask(server: McpServer) {
           .string()
           .optional()
           .describe(
-            "Model override as 'providerID/modelID' (e.g. 'opencode-go/glm-5.2'). Overrides the agent's pre-assigned model for this follow-up only. Discover available models with opencode_list_agents",
+            "Omit by default to retain the session's current model. Only set when the user explicitly requests model selection. An explicit providerID/modelID changes the session model for this and subsequent follow-ups; copy its exact ID from opencode_list_agents.",
           ),
       },
     },
     async ({ task_id, prompt, agent, model }) => {
+      const task = getTask(task_id);
       const resolved = clientForTask(task_id);
-      if (!resolved) {
+      if (!resolved || !task) {
         return jsonError({ task_id, status: "task_not_found" });
       }
       const { client, sessionId } = resolved;
@@ -53,17 +57,35 @@ export function registerOpencodeContinueTask(server: McpServer) {
         }
       }
 
-      try {
-        // Fire-and-forget: promptAsync returns as soon as the prompt is accepted,
-        // the agent keeps working in the background. Poll with get_task_status.
-        await client.session.promptAsync({
-          path: { id: sessionId },
-          body: {
-            parts: [{ type: "text", text: prompt }],
-            ...(agent ? { agent } : {}),
-            ...(parsedModel ? { model: parsedModel } : {}),
-          },
+      if (task.mutating)
+        return jsonError({
+          task_id,
+          status: "error",
+          message: "Another task update is in progress",
         });
+      task.mutating = true;
+      try {
+        if (
+          (await client.session.active())[sessionId] ||
+          (await client.session.inbox.list({ sessionID: sessionId })).length > 0
+        ) {
+          return jsonError({
+            task_id,
+            status: "error",
+            message:
+              "Session is still running or has queued input; wait or cancel before continuing",
+          });
+        }
+        if (agent) await client.session.switchAgent({ sessionID: sessionId, agent });
+        if (parsedModel)
+          await client.session.switchModel({
+            sessionID: sessionId,
+            model: { providerID: parsedModel.providerID, id: parsedModel.modelID },
+          });
+        const inputId = `msg_${randomUUID()}`;
+        const before = await client.session.get({ sessionID: sessionId });
+        resumeTask(task.taskId, inputId, before.time.idle);
+        await client.session.prompt({ sessionID: sessionId, id: inputId, text: prompt });
 
         return jsonResult({
           task_id,
@@ -76,6 +98,8 @@ export function registerOpencodeContinueTask(server: McpServer) {
           status: "error",
           message: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        task.mutating = false;
       }
     },
   );

@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-opencode",
-  "version": "1.2.0",
+  "version": "2.0.0-dev.0",
   "description": "MCP server that lets any MCP host (Claude Code, Codex CLI, Cursor, etc.) drive OpenCode and delegate tasks asynchronously to its agents",
   "main": "./build/src/index.js",
   "types": "./build/src/index.d.ts",
@@ -22,12 +22,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/alejandro-technology/opencode-mcp.git"
+    "url": "git+https://github.com/zys4416/opencode-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/alejandro-technology/opencode-mcp/issues"
+    "url": "https://github.com/zys4416/opencode-mcp/issues"
   },
-  "homepage": "https://opencode-mcp.alejandrotechnology.com",
+  "homepage": "https://github.com/zys4416/opencode-mcp#readme",
   "publishConfig": {
     "access": "public"
   },
@@ -44,7 +44,8 @@
     "test:coverage": "vitest run --coverage",
     "build": "rm -rf build && npx tsc && chmod +x build/src/index.js",
     "prepare": "npm run build",
-    "publish": "npm publish --access public"
+    "publish": "npm publish --access public",
+    "test:integration": "node scripts/smoke-v2.mjs"
   },
   "files": [
     "build",
@@ -52,7 +53,7 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@opencode-ai/sdk": "^1.17.20",
+    "@opencode/client": "2.0.11",
     "zod": "^3.25.76"
   },
   "devDependencies": {
@@ -61,5 +62,8 @@
     "@vitest/coverage-v8": "^4.1.10",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

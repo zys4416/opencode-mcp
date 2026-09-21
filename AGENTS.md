@@ -1,61 +1,42 @@
 # AGENTS.md
 
-Guidance for OpenCode sessions working in this repo.
+## Scope and commands
 
-## Project
+`opencode-mcp` is a TypeScript ESM stdio MCP server. This source version targets OpenCode **2.0.11** with `@opencode/client` **2.0.11**. It manages private `opencode serve --stdio` children, not the shared background service. Keep the binary/client compatibility gate explicit when upgrading.
 
-`opencode-mcp` — an MCP server (stdio transport) that lets an MCP host drive an [OpenCode](https://opencode.ai) instance and delegate work to its subagents. Built on `@modelcontextprotocol/sdk` + Zod, with real OpenCode integration via `@opencode-ai/sdk` (`createOpencodeServer` / `createOpencodeClient`).
+Use pnpm (`npx -y pnpm@10` when pnpm is not installed).
 
-Task delegation is **asynchronous**: `opencode_start_task` creates a session and fires `promptAsync` (fire-and-forget), returning a `task_id` immediately. Status/result are polled separately via `get_task_status` / `get_task_result`, or long-polled via `opencode_wait_for_task` (`mode: "all"` / `"any"`).
+- `pnpm test`: Vitest suites in `tests/`, including native-client HTTP contract fixtures.
+- `pnpm test:coverage`: **100%** lines, statements, branches and functions; do not lower thresholds.
+- `pnpm lint`: read-only Biome check. Apply fixes only to changed files.
+- `pnpm build`: cleans `build`, compiles TypeScript, makes `build/src/index.js` executable.
+- `pnpm test:integration`: requires a current build and OpenCode 2.0.11 (`OPENCODE_BIN` may specify its absolute path). Isolated real-binary test with a local model fixture; no paid provider calls.
 
-## Commands
+## Structure
 
-Package manager is **pnpm** (only `pnpm-lock.yaml` exists). Scripts call `npx`/`pnpx` internally, which works regardless of how you invoke them.
+- `src/index.ts`: registers MCP tools, connects stdio and closes private servers on termination.
+- `src/modules/tools/`: tool registration, Zod input schemas and MCP results. Public names start with `opencode_`.
+- `shared/opencode-server.ts`: version gate, random/shared Basic credentials, JSON startup handshake, authenticated health/PID checks, bounded cleanup. Do not return passwords or forward raw child output.
+- `shared/server-registry.ts`: instance URL, authenticated client, directory, permission health and cleanup.
+- `shared/task-registry.ts`: task/session/input identity, cancellation and concurrent update guard. Task state is in memory.
+- `shared/opencode-client.ts`: shared client lookup, paginated native messages, normalized progress, execution snapshots. Status and result use the same snapshot. Completion requires an idle message after the submitted input or a session terminal timestamp newer than both the input and the previous execution baseline. Permission rejection can omit both session terminal fields and the idle message; a current-input assistant error is terminal only after the session stops being active. An assistant turn completing alone is insufficient.
+- `shared/permissions.ts`: native v2 config and permission fields, ownership/ancestor checks, external read-only policy, SSE and polling reconciliation. Unrelated CLI sessions must not be auto-approved. External reads use `once`, not persistent approvals.
+- `shared/usage-limits.ts`: daily cached public quota metadata; `quotaTier` and `quotaByModelId` are the single sources of quota annotation.
+- `tests/helpers/v2.ts`: real Promise client with an HTTP fixture. Put runtime-only test helpers under `tests/`.
+- `scripts/smoke-v2.mjs`: isolated real-binary integration test.
 
-- `pnpm dev` — launch the MCP Inspector against the server via `tsx` (runs TS directly, no build needed). Use this to test tool wiring interactively.
-- `pnpm test` — `vitest run` (full suite).
-- `pnpm test:coverage` — `vitest run --coverage`. Coverage thresholds are **100%** for lines, branches, functions, and statements (see `vitest.config.ts`) — any uncovered line fails the run.
-- Single test file: `pnpm vitest run src/modules/tools/wait_for_task.test.ts`. Single test by name: add `-t "test name"`.
-- `pnpm build` — clean build: `rm -rf build && tsc && chmod +x build/src/index.js`. **This is also the typecheck** (no separate `typecheck` script). Note: `tsconfig.json` excludes `src/**/*.test.ts`, so type errors in test files only surface through vitest, not `pnpm build`.
-- `pnpm lint` — `biome check .` (read-only).
-- `pnpm lint:write` — biome check + autofix (lint + format).
-- `pnpm lint:format` — biome format only.
+The empty `src/domain`, `src/application` and `src/infrastructure` directories are not implemented layers. There is no separate MCP prompts implementation in this tree.
 
-## Testing
+## Conventions and compatibility
 
-Every module has a `<name>.test.ts` Vitest suite under the parallel `tests/` tree mirroring `src/` (e.g. `src/modules/tools/start_task.ts` → `tests/modules/tools/start_task.test.ts`; see `vitest.config.ts` `include`). `src/test-utils/fake-mcp-server.ts` provides a fake `McpServer` for testing tool/prompt registration without a real transport. Tests run in a `node` environment; `src/test-utils/` is excluded from coverage. When adding or changing a module, keep its test file at 100% coverage or `pnpm test:coverage` fails.
-
-## Architecture
-
-- Entrypoint: `src/index.ts` — creates `McpServer`, calls `registerTools(server)` and `registerPrompts(server)`, connects a `StdioServerTransport`. Installs `SIGHUP`/`SIGINT`/`SIGTERM`/`exit` handlers that call `killAllServers()` so no `opencode serve` child outlives the MCP process.
-- All tools live in `src/modules/tools/*.ts`. Each exports a `registerOpencode<Name>(server: McpServer)` function that calls `server.registerTool(...)`. They are wired together in `src/modules/tools/index.ts`.
-- MCP prompts live in `src/modules/prompts/*.ts`, each exporting a `register<Name>Prompt(server: McpServer)` function that calls `server.registerPrompt(...)`. They are wired together in `src/modules/prompts/index.ts` via `registerPrompts`.
-- Registered tool names are prefixed `opencode_` (e.g. `opencode_start_task`); the source filenames are not prefixed (`start_task.ts`).
-- `src/modules/shared/` holds cross-tool infrastructure:
-  - `server-registry.ts` — in-memory `Map<serverId, { serverId, baseUrl, close }>`; `killAllServers()` reaps every tracked child on shutdown.
-  - `task-registry.ts` — in-memory `Map<taskId, { taskId, serverId, sessionId, createdAt?, cancelledAt? }>` linking a delegated task to its OpenCode session. `markTaskCancelled()` stamps `cancelledAt`; `cancel_task` calls it after a successful abort. Aborting alone leaves no trace — the session's last assistant message keeps its completed timestamp — so without the stamp a deliberately killed task reads as a normal success.
-  - `opencode-client.ts` — `clientForServer(id)` / `clientForTask(id)` build `OpencodeClient`s from the registries. `assistantEntries()` fetches every assistant message for a session (one HTTP call); `lastAssistantEntry()` is `.at(-1)` of that, and `sessionParts()` flattens them. `deriveTaskStatus()` checks `cancelledAt` first and returns `cancelled` before any session lookup, then returns `empty` — not `completed` — when a finished turn has no text and no tool calls, because a completed timestamp says the turn ended, not that it did work. `buildProgress(latest, whole)` reads `text_snippet` / `current_tool` from the **latest** turn but `tool_calls_completed` / `mutating_tool_calls` / `files_touched` from the **whole session**: an agent's edits land in earlier turns while the final turn is usually just "DONE", so evidence read off the last message alone reports `files_touched: []` for a task that rewrote the workspace.
-  - `mcp-result.ts` — `jsonResult()` / `jsonError()` helpers that serialize a payload as an MCP text tool result (use these for consistent output).
-  - `instructions.ts` — `createDelegateTaskInstructions()` builds the MCP server instructions. It is **async**: it awaits the quota snapshot before returning, so `src/index.ts` awaits `createServer()`. It embeds only the *spend budget* plus the static tier legend — per-model quotas are deliberately NOT repeated here, because `opencode_list_agents` reports them keyed by the real model id. Don't reintroduce a model table: it would be a second, name-keyed copy of data the agent must fetch anyway.
-  - `usage-limits.ts` — exports `quotaTier()` (the thresholds live there only), `quotaByModelId()`, which indexes the snapshot by slugified display name so live model ids join onto docs rows (`MiMo-V2.5` → `mimo-v2.5`), `formatUsageLimits()` (source + spend budget, for the instructions) and `formatTierGuide()` (static legend keyed by the exact `tier` values `opencode_list_agents` emits). `opencode_list_agents` uses `quotaTier`/`quotaByModelId` to annotate every model with its quota. Scrapes the OpenCode Go quota table from https://opencode.ai/docs/es/go/ and renders it as the model-selection block inside the instructions. The snapshot is cached on disk (`OPENCODE_MCP_CACHE_DIR` > `XDG_CACHE_HOME` > `~/.cache`, under `opencode-mcp/usage-limits.json`) and refetched at most once every 24h (`OPENCODE_MCP_LIMITS_TTL_MS` overrides the TTL). A failed fetch falls back to the stale snapshot, then to a quota-agnostic paragraph — startup never depends on the network. Model tiers (high volume / balanced / scarce) are derived from the live req/5h numbers, not hardcoded model names, so the block stays correct when OpenCode changes its lineup.
-  - `permissions.ts` — keeps delegated tasks from wedging on permission prompts. A headless `opencode serve` has no interactive approver, so any permission resolved to `ask` blocks the agent **forever**: the session stays genuinely `busy` and the task neither completes nor fails. Two layers: `buildServerConfig()` is passed to `createOpencodeServer` (OpenCode deep-merges it per permission key, so the user's own `read`/`edit`/`bash` deny globs survive untouched), and `startPermissionResponder()` subscribes to the event stream and answers every request. `getExternalDirectoryPolicy()` resolves the policy: `OPENCODE_MCP_EXTERNAL_DIR` env var > `OPENCODE_MCP_EXTERNAL_DIR=<policy>` CLI arg > `read-only` default. Policies: `read-only` (reads outside the cwd approved, writes rejected), `allow`, `deny`. Inside the cwd everything is auto-approved — the caller already owns that directory. External reads are answered `once`, never `always`, because an `always` reply persists keyed by *directory pattern* rather than by operation and would silently let a later write into the same directory through.
-  - `config.ts` — `getMaxToolTimeoutMs()` resolves the server-side clamp for `opencode_wait_for_task` timeouts: `MCP_TOOL_TIMEOUT` env var > `MCP_TOOL_TIMEOUT=<ms>` CLI arg > 300000 ms default. Reads `process.env`/`process.argv` lazily on each call so tests can vary them.
-- `src/domain`, `src/application`, `src/infrastructure` contain only **empty subdirectories** (no `.ts` files). The real code lives in `src/modules/`; don't treat the Clean Architecture folders as populated layers.
-
-`opencode_list_agents` returns `models.providers[].models` as objects (`{ id, quota }`), **not** plain id strings, plus a sibling `models.quota_snapshot` (`{ source, checked }` or `null`) that distinguishes "this model has no quota row" from "we never got the table". `quota` is `null` for models absent from the OpenCode Go docs — verified against a live server, all 22 `opencode-go` ids match a docs row and the 7 `opencode` free/preview models do not.
-
-### Adding a tool
-
-1. Create `src/modules/tools/<name>.ts` exporting `registerOpencode<Name>(server: McpServer)`.
-2. Register it in `src/modules/tools/index.ts` (import + call inside `registerTools`).
-3. The tool name passed to `server.registerTool` must be `opencode_<name>`; define `inputSchema` with Zod.
-4. Reuse `shared/mcp-result.ts` (`jsonResult`/`jsonError`) for results and `shared/opencode-client.ts` (`clientForServer`/`clientForTask`) for SDK access instead of constructing clients ad hoc — other tools rely on the registries staying the source of truth for server/task identity.
-5. Add `tests/modules/tools/<name>.test.ts` (use `src/test-utils/fake-mcp-server.ts` to capture the registration) — coverage thresholds are 100%.
-
-## Gotchas
-
-- **The generated SDK types lag the running binary.** Verified against opencode `1.18.18` with `@opencode-ai/sdk` `1.17.20`: the live permission event is `permission.asked` (the SDK declares only `permission.updated`), its kind arrives as `properties.permission` (the SDK's `Permission` says `type`), and the call id is nested under `properties.tool.callID` (the SDK puts it at the top level). `shared/permissions.ts` declares its own `PermissionAsk` and reads both spellings. The SDK's `Config.permission` is stale too — it types `edit` as a bare `"ask" | "allow" | "deny"`, but the binary accepts an object of globs. **Verify wire shapes against a live server before trusting a generated type**; a mismatch here fails silently, because a permission that is never answered just hangs.
-- **ESM + NodeNext**: `"type": "module"` with `moduleResolution: NodeNext`. All relative imports in `.ts` files must use `.js` extensions (e.g. `from "./modules/tools/index.js"`), even though the source is `.ts`.
-- **Build output lives at `build/src/index.js`** (not `build/index.js`) because `rootDir` is `"./"` with sources under `src/`. `package.json` `main`/`bin` correctly point there; keep them in sync if `rootDir` ever changes. `pnpm build` wipes `build/` first and `chmod +x`'s the entrypoint (it has a shebang), and `prepare` runs the build on install.
-- **`tsconfig.json` `include` has stale globs**: `["index.ts", "src/**/*.ts", "bin/**/*.ts"]`. The root `index.ts` and `bin/**/*.ts` don't exist — they're harmless no-ops (tsc ignores missing globs). `src/**/*.ts` is the glob that actually compiles the codebase.
-- Biome: 2-space indent, 100 cols, double quotes, organizes imports on write. `build/` is excluded via both `.gitignore` and biome's `!!**/build` negation.
+- Relative TypeScript imports use `.js` suffixes (NodeNext ESM).
+- Build entrypoint is `build/src/index.js`. Keep package `main`/`bin` and installation instructions consistent.
+- Reuse the authenticated client in the registry; never create unauthenticated clients in individual tools.
+- Use v2 native request/response types. Many Promise methods unwrap `data`, while catalog/list methods preserve their envelopes. Tests should exercise actual HTTP serialization, not invented SDK return shapes.
+- `agents.available` is authoritative. v2 has no native/custom provenance; do not infer it from display names. Use agent `id` as the selectable `name`.
+- MCP guidance is default-first: omit `model` unless the user explicitly asks for model selection. Do not reintroduce cost/quota-based automatic overrides or mandatory model discovery before each task.
+- Model selections use `{ providerID, id }`; `modelID` in catalog metadata is not necessarily the selection ID.
+- A prompt response is admission, not completion. Record its explicit message ID before sending. Never blindly retry uncertain admissions.
+- Follow-up model/agent switches persist for the session. Do not advertise them as temporary per-turn overrides.
+- v2 tool parts use `name`, `id`, `state`, and path inputs commonly use `path`. Preserve pagination and execution boundaries when aggregating evidence.
+- No secrets, local provider configuration or production/session contents belong in tests or docs.

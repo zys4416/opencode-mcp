@@ -2,6 +2,9 @@ export interface TaskRecord {
   taskId: string;
   serverId: string;
   sessionId: string;
+  inputId?: string;
+  previousIdleAt?: number;
+  mutating?: boolean;
   /** Epoch ms when the task was started; used to detect tasks that never produced output. */
   createdAt?: number;
   /**
@@ -34,4 +37,19 @@ export function markTaskCancelled(taskId: string, at: number = Date.now()) {
 
 export function removeTask(taskId: string) {
   tasks.delete(taskId);
+}
+
+export function resumeTask(taskId: string, inputId: string, previousIdleAt = 0) {
+  const task = tasks.get(taskId);
+  if (!task) return;
+  task.inputId = inputId;
+  task.previousIdleAt = previousIdleAt;
+  task.createdAt = Date.now();
+  delete task.cancelledAt;
+}
+
+export function ownsSession(serverId: string, sessionId: string): boolean {
+  return [...tasks.values()].some(
+    (task) => task.serverId === serverId && task.sessionId === sessionId,
+  );
 }

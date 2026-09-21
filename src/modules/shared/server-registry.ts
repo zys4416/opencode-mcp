@@ -1,6 +1,10 @@
+import type { OpenCodeClient } from "@opencode/client";
 export interface OpencodeServerInstance {
   serverId: string;
   baseUrl: string;
+  client: OpenCodeClient;
+  directory: string;
+  permissionError?: string;
   close: () => void;
 }
 

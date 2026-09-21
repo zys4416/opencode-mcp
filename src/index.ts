@@ -11,7 +11,7 @@ async function createServer() {
   return new McpServer(
     {
       name: "opencode-mcp",
-      version: "1.0.0",
+      version: "2.0.0-dev.0",
       title: "OpenCode MCP",
       description:
         "MCP server that drives an OpenCode instance and delegates work asynchronously to its agents",

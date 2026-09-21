@@ -55,3 +55,9 @@ describe("markTaskCancelled", () => {
     expect(getTask("nope")).toBeUndefined();
   });
 });
+
+it("ignores attempts to resume an unknown task", async () => {
+  const { resumeTask } = await import("../../../src/modules/shared/task-registry.js");
+  resumeTask("unknown", "msg_test");
+  expect(getTask("unknown")).toBeUndefined();
+});

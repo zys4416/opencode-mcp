@@ -1,78 +1,35 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDelegateTaskInstructions } from "../../../src/modules/shared/instructions.js";
-import type { UsageLimits } from "../../../src/modules/shared/usage-limits.js";
 
-const { getUsageLimitsMock } = vi.hoisted(() => ({
-  getUsageLimitsMock: vi.fn<() => Promise<UsageLimits | null>>(),
-}));
+const { getUsageLimits } = vi.hoisted(() => ({ getUsageLimits: vi.fn() }));
+vi.mock("../../../src/modules/shared/usage-limits.js", () => ({ getUsageLimits }));
 
-vi.mock("../../../src/modules/shared/usage-limits.js", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../../../src/modules/shared/usage-limits.js")>();
-  return { ...actual, getUsageLimits: getUsageLimitsMock };
-});
-
-const LIMITS: UsageLimits = {
-  source: "https://opencode.ai/docs/es/go/#límites-de-uso",
-  fetchedAt: "2026-08-21T10:00:00.000Z",
-  spendBudget: { fiveHours: "$12", weekly: "$30", monthly: "$60" },
-  models: [
-    { model: "Grok 4.5", perFiveHours: 120, perWeek: 300, perMonth: 600 },
-    { model: "MiMo-V2.5", perFiveHours: 30_100, perWeek: 75_200, perMonth: 150_400 },
-  ],
-};
-
-describe("createDelegateTaskInstructions", () => {
-  beforeEach(() => {
-    getUsageLimitsMock.mockReset();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it("tells the agent to build ids only from list_agents output", async () => {
-    getUsageLimitsMock.mockResolvedValue(LIMITS);
-
+describe("default-first delegation instructions", () => {
+  it("leaves default resolution to OpenCode on new tasks and follow-ups", async () => {
     const instructions = await createDelegateTaskInstructions();
+    expect(instructions).toContain(
+      "Omit the model parameter by default on both opencode_start_task and opencode_continue_task",
+    );
+    expect(instructions).toContain("retain the session's current model");
+    expect(instructions).toContain("Do not copy a discovered default model ID");
+    expect(instructions).toContain("Omit agent when no specific agent is needed");
+  });
 
+  it("permits explicit user-directed model selection without guessing or silent substitution", async () => {
+    const instructions = await createDelegateTaskInstructions();
+    expect(instructions).toContain("Only provide model when the user explicitly requests");
     expect(instructions).toContain(
       "models.providers[].provider + '/' + models.providers[].models[].id",
     );
-    expect(instructions).toContain("both copied verbatim");
-    expect(instructions).toContain("unknown_model");
+    expect(instructions).toContain("report the mismatch instead of silently switching");
   });
 
-  it("embeds the live spend budget and the tier legend", async () => {
-    getUsageLimitsMock.mockResolvedValue(LIMITS);
-
+  it("keeps discovery optional and removes quota-driven selection from startup", async () => {
     const instructions = await createDelegateTaskInstructions();
-
-    expect(instructions).toContain("checked 2026-08-21");
-    expect(instructions).toContain("Shared spend budget: $12 per 5 hours");
-    expect(instructions).toContain("- high-volume: 3,000+ req/5h");
-    expect(instructions).toContain("- scarce: under 500 req/5h");
-  });
-
-  it("does not restate the per-model quotas that list_agents already reports", async () => {
-    getUsageLimitsMock.mockResolvedValue(LIMITS);
-
-    const instructions = await createDelegateTaskInstructions();
-
-    expect(instructions).not.toContain("Grok 4.5");
-    expect(instructions).not.toContain("30,100");
-    // The tier-to-task mapping must appear exactly once.
-    expect(instructions.match(/exploration/g)).toHaveLength(1);
-  });
-
-  it("degrades to a quota-aware fallback when the limits cannot be resolved", async () => {
-    getUsageLimitsMock.mockResolvedValue(null);
-
-    const instructions = await createDelegateTaskInstructions();
-
-    expect(instructions).toContain("OpenCode Go usage limits — unavailable right now");
-    // The tier legend is static, so it survives a failed fetch.
-    expect(instructions).toContain("- balanced: 500-2,999 req/5h");
+    expect(getUsageLimits).not.toHaveBeenCalled();
+    expect(instructions).toContain("It is not a prerequisite for starting a task");
+    expect(instructions).not.toContain("Default to the cheapest");
+    expect(instructions).not.toContain("Choose by tier");
     expect(instructions).toContain("opencode_wait_for_task");
   });
 });

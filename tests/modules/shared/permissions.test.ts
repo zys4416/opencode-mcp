@@ -1,96 +1,13 @@
-import type { OpencodeClient } from "@opencode-ai/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildServerConfig,
   DEFAULT_EXTERNAL_DIRECTORY_POLICY,
   decidePermission,
-  type ExternalDirectoryPolicy,
   getExternalDirectoryPolicy,
-  type PermissionAsk,
-  type PermissionResponder,
-  permissionCallID,
-  permissionKind,
   startPermissionResponder,
 } from "../../../src/modules/shared/permissions.js";
-
-/**
- * Mirrors the payload the live server emits (opencode 1.18.18): `permission`
- * rather than `type`, and the call id nested under `tool`.
- */
-function ask(overrides: Partial<PermissionAsk> = {}): PermissionAsk {
-  return {
-    id: "per_1",
-    sessionID: "ses_1",
-    permission: "external_directory",
-    patterns: ["/private/tmp/*"],
-    always: ["/private/tmp/*"],
-    metadata: { filepath: "/private/tmp/brief.md", parentDir: "/private/tmp" },
-    tool: { messageID: "msg_1", callID: "read_0" },
-    ...overrides,
-  };
-}
-
-interface FakeClientOptions {
-  messages?: unknown;
-  subscribe?: () => Promise<{ stream: AsyncGenerator<unknown> }>;
-  reply?: (args: unknown) => Promise<unknown>;
-}
-
-function fakeClient(options: FakeClientOptions = {}) {
-  const replies: unknown[] = [];
-  const client = {
-    session: {
-      messages: vi.fn(async () => ({ data: options.messages })),
-    },
-    event: {
-      subscribe: options.subscribe ?? vi.fn(),
-    },
-    postSessionIdPermissionsPermissionId: vi.fn(async (args: unknown) => {
-      replies.push(args);
-      return options.reply ? options.reply(args) : { data: {} };
-    }),
-  };
-  return { client: client as unknown as OpencodeClient, raw: client, replies };
-}
-
-function toolMessages(callID: string, tool: string) {
-  return [
-    { info: { role: "assistant" }, parts: [{ type: "text", text: "hi" }] },
-    { info: { role: "assistant" }, parts: [{ type: "tool", callID, tool, state: {} }] },
-  ];
-}
-
-async function* streamOf(...events: unknown[]) {
-  for (const event of events) yield event;
-}
-
-const noSleep = async () => {};
-
-describe("permission field compatibility", () => {
-  it("reads the kind from the live `permission` field", () => {
-    expect(permissionKind(ask())).toBe("external_directory");
-  });
-
-  it("falls back to the generated-SDK `type` field", () => {
-    expect(permissionKind({ id: "p", sessionID: "s", type: "bash" })).toBe("bash");
-  });
-
-  it("returns undefined when neither field is present", () => {
-    expect(permissionKind({ id: "p", sessionID: "s" })).toBeUndefined();
-  });
-
-  it("reads the call id from the live nested `tool` field", () => {
-    expect(permissionCallID(ask())).toBe("read_0");
-  });
-
-  it("falls back to a top-level call id", () => {
-    expect(permissionCallID({ id: "p", sessionID: "s", callID: "legacy_1" })).toBe("legacy_1");
-  });
-
-  it("returns undefined when no call id is present", () => {
-    expect(permissionCallID({ id: "p", sessionID: "s" })).toBeUndefined();
-  });
-});
+import { registerTask, removeTask } from "../../../src/modules/shared/task-registry.js";
+import { assistant, fixture } from "../../helpers/v2.js";
 
 describe("getExternalDirectoryPolicy", () => {
   const originalEnv = process.env.OPENCODE_MCP_EXTERNAL_DIR;
@@ -139,418 +56,176 @@ describe("getExternalDirectoryPolicy", () => {
   });
 });
 
-describe("buildServerConfig", () => {
-  it("keeps external_directory on ask so the responder can apply the read/write split", () => {
-    expect(buildServerConfig("read-only")).toEqual({
-      permission: { external_directory: "ask" },
-    });
-  });
-
-  it("maps allow and deny straight through to the config", () => {
-    expect(buildServerConfig("allow")).toEqual({ permission: { external_directory: "allow" } });
-    expect(buildServerConfig("deny")).toEqual({ permission: { external_directory: "deny" } });
-  });
-
-  it("touches only external_directory so user deny globs survive the merge", () => {
-    const config = buildServerConfig("read-only");
-    expect(Object.keys(config.permission ?? {})).toEqual(["external_directory"]);
-  });
-});
-
-describe("decidePermission", () => {
-  it("approves anything that is not external_directory with always", async () => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(
-      client,
-      ask({ permission: "bash", metadata: { command: "git commit -m x" } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision).toEqual({
-      response: "always",
-      reason: "inside the server working directory",
-    });
-  });
-
-  it("recognises a non-external permission sent under the legacy `type` field", async () => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(
-      client,
-      { id: "p", sessionID: "s", type: "bash" },
-      "read-only",
-      noSleep,
-    );
-    expect(decision.response).toBe("always");
-  });
-
-  it("approves external access with always under the allow policy", async () => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(client, ask(), "allow", noSleep);
-    expect(decision.response).toBe("always");
-  });
-
-  it("rejects external access under the deny policy", async () => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(client, ask(), "deny", noSleep);
-    expect(decision.response).toBe("reject");
-  });
-
-  it("rejects an external shell command without correlating a tool", async () => {
-    const { client, raw } = fakeClient();
-    const decision = await decidePermission(
-      client,
-      ask({ metadata: { command: "rm -rf /tmp/x", directories: ["/tmp"] } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision).toEqual({
-      response: "reject",
-      reason: "shell command outside the working directory",
-    });
-    expect(raw.session.messages).not.toHaveBeenCalled();
-  });
-
-  it("approves an external read with once, not always", async () => {
-    const { client, raw } = fakeClient();
-    const decision = await decidePermission(client, ask(), "read-only", noSleep);
-    expect(decision).toEqual({ response: "once", reason: "'read' only reads" });
-    // The call id encodes the tool, so no message round-trip is needed.
-    expect(raw.session.messages).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    "grep_3",
-    "glob_1",
-    "websearch_0",
-    "webfetch_12",
-  ])("approves the read-only call id %s", async (callID) => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(
-      client,
-      ask({ tool: { callID } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision.response).toBe("once");
-  });
-
-  it("rejects an external write", async () => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(
-      client,
-      ask({ tool: { callID: "write_0" } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision).toEqual({
-      response: "reject",
-      reason: "'write' writes outside the working directory",
-    });
-  });
-
-  it("rejects when the permission carries no call id", async () => {
-    const { client, raw } = fakeClient();
-    const decision = await decidePermission(client, ask({ tool: undefined }), "read-only", noSleep);
-    expect(decision).toEqual({
-      response: "reject",
-      reason: "could not identify the tool behind the request",
-    });
-    expect(raw.session.messages).not.toHaveBeenCalled();
-  });
-
-  it("falls back to session correlation when the call id does not encode a tool", async () => {
-    const { client, raw } = fakeClient({ messages: toolMessages("opaque", "read") });
-    const decision = await decidePermission(
-      client,
-      ask({ tool: { callID: "opaque" } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision.response).toBe("once");
-    expect(raw.session.messages).toHaveBeenCalledOnce();
-  });
-
-  it("rejects when correlation never matches a tool part", async () => {
-    const { client, raw } = fakeClient({ messages: toolMessages("other", "read") });
-    const decision = await decidePermission(
-      client,
-      ask({ tool: { callID: "opaque" } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision.response).toBe("reject");
-    expect(raw.session.messages).toHaveBeenCalledTimes(3);
-  });
-
-  it("rejects when the session has no messages at all", async () => {
-    const { client } = fakeClient({ messages: undefined });
-    const decision = await decidePermission(
-      client,
-      ask({ tool: { callID: "opaque" } }),
-      "read-only",
-      noSleep,
-    );
-    expect(decision.response).toBe("reject");
-  });
-
-  it("retries correlation, using the real sleep, when the tool part lands late", async () => {
-    const messages = vi
-      .fn()
-      .mockResolvedValueOnce({ data: [] })
-      .mockResolvedValue({ data: toolMessages("opaque", "read") });
-    const client = { session: { messages } } as unknown as OpencodeClient;
-
-    const decision = await decidePermission(
-      client,
-      ask({ tool: { callID: "opaque" } }),
-      "read-only",
-    );
-
-    expect(decision.response).toBe("once");
-    expect(messages).toHaveBeenCalledTimes(2);
-  });
-
-  it("tolerates a request with no metadata", async () => {
-    const { client } = fakeClient();
-    const decision = await decidePermission(
-      client,
-      { id: "p", sessionID: "s", permission: "external_directory", tool: { callID: "read_0" } },
-      "read-only",
-      noSleep,
-    );
-    expect(decision.response).toBe("once");
-  });
-});
-
-describe("startPermissionResponder", () => {
-  it("answers a permission.asked request and reports the decision", async () => {
-    let responder!: PermissionResponder;
-    const decisions: unknown[] = [];
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf({ type: "permission.asked", properties: ask({ permission: "bash" }) }),
-    }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    responder = startPermissionResponder(client, {
-      policy: "read-only",
-      sleep: async () => responder.stop(),
-      onDecision: (a, d) => decisions.push([a.id, d.response]),
-    });
-    await responder.done;
-
-    expect(replies).toEqual([
-      { path: { id: "ses_1", permissionID: "per_1" }, body: { response: "always" } },
-    ]);
-    expect(decisions).toEqual([["per_1", "always"]]);
-  });
-
-  it("also answers the generated-SDK permission.updated event", async () => {
-    let responder!: PermissionResponder;
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf({ type: "permission.updated", properties: ask({ permission: "bash" }) }),
-    }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    responder = startPermissionResponder(client, {
-      policy: "read-only",
-      sleep: async () => responder.stop(),
-    });
-    await responder.done;
-
-    expect(replies).toHaveLength(1);
-  });
-
-  it("ignores events that are not permission requests", async () => {
-    let responder!: PermissionResponder;
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf(
-        { type: "session.status", properties: {} },
-        { type: "message.part.delta", properties: {} },
-      ),
-    }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    responder = startPermissionResponder(client, {
-      policy: "allow",
-      sleep: async () => responder.stop(),
-    });
-    await responder.done;
-
-    expect(replies).toEqual([]);
-  });
-
-  it("approves an external read and rejects an external write", async () => {
-    let responder!: PermissionResponder;
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf(
-        { type: "permission.asked", properties: ask({ id: "p-read" }) },
+describe("v2 permissions", () => {
+  const ask = {
+    id: "per_test",
+    sessionID: "ses_test",
+    action: "external_directory",
+    resources: ["/external/*"],
+    source: { type: "tool" as const, messageID: "msg_answer", id: "call_test" },
+  };
+  it.each(["allow", "deny", "read-only"] as const)("builds native configuration %s", (policy) =>
+    expect(buildServerConfig(policy)).toEqual({
+      permissions: [
         {
-          type: "permission.asked",
-          properties: ask({ id: "p-write", tool: { callID: "write_0" } }),
+          action: "external_directory",
+          resource: "*",
+          effect: policy === "read-only" ? "ask" : policy,
         },
-      ),
+      ],
     }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    responder = startPermissionResponder(client, {
+  it("retains policy decisions without persisting external read approvals", async () => {
+    const { client, routes } = fixture();
+    expect((await decidePermission(client, { ...ask, action: "edit" }, "read-only")).response).toBe(
+      "always",
+    );
+    expect((await decidePermission(client, ask, "allow")).response).toBe("always");
+    expect((await decidePermission(client, ask, "deny")).response).toBe("reject");
+    expect(
+      (await decidePermission(client, { ...ask, source: undefined }, "read-only")).response,
+    ).toBe("reject");
+    expect(
+      (await decidePermission(client, { ...ask, metadata: { command: "rm" } }, "read-only"))
+        .response,
+    ).toBe("reject");
+    for (const name of ["read", "write"]) {
+      routes.set("GET /api/session/ses_test/message/msg_answer", {
+        data: {
+          ...assistant,
+          content: [
+            { type: "text", text: "hi" },
+            { type: "tool", id: "call_test", name, state: { status: "running", input: {} } },
+          ],
+        },
+      });
+      expect((await decidePermission(client, ask, "read-only")).response).toBe(
+        name === "read" ? "once" : "reject",
+      );
+    }
+    routes.set("GET /api/session/ses_test/message/msg_answer", { data: { type: "user" } });
+    expect((await decidePermission(client, ask, "read-only")).response).toBe("reject");
+  });
+  it("polls missed requests, restricts ownership, recovers failures and aborts both loops", async () => {
+    vi.useFakeTimers();
+    const { client, routes } = fixture();
+    registerTask({ taskId: "owner", serverId: "srv_test", sessionId: "ses_test" });
+    const request = vi
+      .spyOn(client.permission.request, "list")
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValue({
+        location: { directory: "/project" },
+        data: [{ ...ask, action: "edit" }],
+      });
+    const reply = vi.spyOn(client.permission, "reply").mockResolvedValue(undefined);
+    const onError = vi.fn(),
+      onHealthy = vi.fn();
+    vi.spyOn(client.event, "subscribe").mockImplementation(async function* () {
+      yield { type: "server.connected" } as never;
+      throw new Error("disconnect");
+    });
+    const responder = startPermissionResponder(client, {
+      serverId: "srv_test",
+      directory: "/project",
       policy: "read-only",
-      sleep: async () => responder.stop(),
+      onError,
+      onHealthy,
     });
-    await responder.done;
-
-    expect(replies).toEqual([
-      { path: { id: "ses_1", permissionID: "p-read" }, body: { response: "once" } },
-      { path: { id: "ses_1", permissionID: "p-write" }, body: { response: "reject" } },
-    ]);
-  });
-
-  it("stops mid-stream without answering the remaining requests", async () => {
-    let responder!: PermissionResponder;
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf(
-        { type: "permission.asked", properties: ask({ id: "p-1", permission: "bash" }) },
-        { type: "permission.asked", properties: ask({ id: "p-2", permission: "bash" }) },
-      ),
-    }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    responder = startPermissionResponder(client, {
-      policy: "allow",
-      sleep: noSleep,
-      onDecision: () => responder.stop(),
-    });
-    await responder.done;
-
-    expect(replies).toHaveLength(1);
-  });
-
-  it("exits after the stream drains when stopped, without waiting to reconnect", async () => {
-    let responder!: PermissionResponder;
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf({ type: "permission.asked", properties: ask({ permission: "bash" }) }),
-    }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    // No `sleep` override: stopping inside the stream must short-circuit the
-    // reconnect wait, so the built-in timer is never armed.
-    responder = startPermissionResponder(client, {
-      policy: "allow",
-      onDecision: () => responder.stop(),
-    });
-    await responder.done;
-
-    expect(replies).toHaveLength(1);
-    expect(subscribe).toHaveBeenCalledOnce();
-  });
-
-  it("reports a subscribe failure and re-subscribes until stopped", async () => {
-    let responder!: PermissionResponder;
-    const errors: unknown[] = [];
-    const subscribe = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("stream down"))
-      .mockImplementation(async () => ({ stream: streamOf() }));
-    const { client } = fakeClient({ subscribe });
-
-    let sleeps = 0;
-    responder = startPermissionResponder(client, {
-      policy: "allow",
-      onError: (error) => errors.push(error),
-      sleep: async () => {
-        sleeps++;
-        if (sleeps === 2) responder.stop();
-      },
-    });
-    await responder.done;
-
-    expect((errors[0] as Error).message).toBe("stream down");
-    expect(subscribe).toHaveBeenCalledTimes(2);
-  });
-
-  it("reports a reply failure without tearing down the MCP server", async () => {
-    let responder!: PermissionResponder;
-    const errors: unknown[] = [];
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf({ type: "permission.asked", properties: ask({ permission: "bash" }) }),
-    }));
-    const { client } = fakeClient({
-      subscribe,
-      reply: async () => {
-        throw new Error("reply failed");
-      },
-    });
-
-    responder = startPermissionResponder(client, {
-      policy: "allow",
-      onError: (error) => errors.push(error),
-      sleep: async () => responder.stop(),
-    });
-    await responder.done;
-
-    expect((errors[0] as Error).message).toBe("reply failed");
-  });
-
-  it("swallows errors and decisions when no callbacks are supplied", async () => {
-    let responder!: PermissionResponder;
-    const subscribe = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("silent"))
-      .mockImplementation(async () => ({
-        stream: streamOf({
-          type: "permission.asked",
-          properties: ask({ permission: "bash" }),
-        }),
-      }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    let sleeps = 0;
-    responder = startPermissionResponder(client, {
-      policy: "allow",
-      sleep: async () => {
-        sleeps++;
-        if (sleeps === 2) responder.stop();
-      },
-    });
-    await responder.done;
-
-    expect(replies).toHaveLength(1);
-  });
-
-  it("returns immediately when stopped before the stream yields", async () => {
-    const subscribe = vi.fn(async () => ({ stream: streamOf({ type: "permission.asked" }) }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    const responder = startPermissionResponder(client, { policy: "allow", sleep: noSleep });
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(onError).toHaveBeenCalled();
+    expect(reply).toHaveBeenCalledWith(
+      { sessionID: "ses_test", requestID: "per_test", decision: "always" },
+      expect.anything(),
+    );
+    expect(onHealthy).toHaveBeenCalled();
+    removeTask("owner");
+    routes.set("GET /api/session/ses_test", { data: { id: "ses_test" } });
+    reply.mockClear();
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(reply).not.toHaveBeenCalled();
     responder.stop();
     await responder.done;
-
-    expect(replies).toEqual([]);
+    expect(request).toHaveBeenCalled();
+    vi.useRealTimers();
   });
-
-  it("falls back to the resolved policy when none is passed", async () => {
-    const original = process.env.OPENCODE_MCP_EXTERNAL_DIR;
-    process.env.OPENCODE_MCP_EXTERNAL_DIR = "deny";
-    let responder!: PermissionResponder;
-    const subscribe = vi.fn(async () => ({
-      stream: streamOf({ type: "permission.asked", properties: ask() }),
-    }));
-    const { client, replies } = fakeClient({ subscribe });
-
-    responder = startPermissionResponder(client, { sleep: async () => responder.stop() });
+  it("answers events for descendant sessions and deduplicates concurrent replies", async () => {
+    vi.useFakeTimers();
+    const { client } = fixture();
+    registerTask({ taskId: "owner", serverId: "srv_test", sessionId: "parent" });
+    vi.spyOn(client.session, "get").mockResolvedValue({ parentID: "parent" } as never);
+    vi.spyOn(client.permission.request, "list").mockResolvedValue({
+      location: { directory: "/project" },
+      data: [{ ...ask, action: "edit" }],
+    });
+    vi.spyOn(client.event, "subscribe").mockImplementation(async function* () {
+      yield { type: "permission.asked", data: { ...ask, action: "edit" } } as never;
+    });
+    const reply = vi
+      .spyOn(client.permission, "reply")
+      .mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(undefined), 100)),
+      );
+    const responder = startPermissionResponder(client, {
+      serverId: "srv_test",
+      directory: "/project",
+      policy: "read-only",
+      onError: vi.fn(),
+      onHealthy: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(reply).toHaveBeenCalledOnce();
+    responder.stop();
     await responder.done;
-
-    expect(replies).toEqual([
-      { path: { id: "ses_1", permissionID: "per_1" }, body: { response: "reject" } },
-    ]);
-
-    if (original === undefined) delete process.env.OPENCODE_MCP_EXTERNAL_DIR;
-    else process.env.OPENCODE_MCP_EXTERNAL_DIR = original;
+    removeTask("owner");
+    vi.useRealTimers();
+  });
+  it("rejects ancestry cycles and suppresses abort errors", async () => {
+    vi.useFakeTimers();
+    const { client } = fixture();
+    vi.spyOn(client.session, "get").mockResolvedValue({ parentID: "ses_test" } as never);
+    vi.spyOn(client.permission.request, "list").mockResolvedValue({
+      location: { directory: "/project" },
+      data: [ask],
+    });
+    vi.spyOn(client.event, "subscribe").mockImplementation(async function* ({ signal } = {}) {
+      await new Promise((_, reject) =>
+        signal?.addEventListener("abort", () => reject(new Error("abort"))),
+      );
+    });
+    const reply = vi.spyOn(client.permission, "reply");
+    const onError = vi.fn();
+    const responder = startPermissionResponder(client, {
+      serverId: "none",
+      directory: "/project",
+      policy: "deny",
+      onError,
+      onHealthy: vi.fn(),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    responder.stop();
+    await responder.done;
+    expect(reply).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 });
-
-describe("policy type", () => {
-  it("covers every documented policy", () => {
-    const policies: ExternalDirectoryPolicy[] = ["read-only", "allow", "deny"];
-    expect(policies.map(buildServerConfig)).toHaveLength(3);
+it("suppresses polling errors caused by shutdown", async () => {
+  const { client } = fixture();
+  vi.spyOn(client.permission.request, "list").mockImplementation(
+    (_input, { signal } = {}) =>
+      new Promise((_, reject) =>
+        signal?.addEventListener("abort", () => reject(new Error("abort"))),
+      ),
+  );
+  vi.spyOn(client.event, "subscribe").mockImplementation(async function* () {});
+  const onError = vi.fn();
+  const responder = startPermissionResponder(client, {
+    serverId: "none",
+    directory: "/project",
+    policy: "deny",
+    onError,
+    onHealthy: vi.fn(),
   });
+  responder.stop();
+  await responder.done;
+  expect(onError).not.toHaveBeenCalled();
 });

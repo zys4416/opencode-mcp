@@ -1,137 +1,53 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakeMcpServer } from "../../../src/test-utils/fake-mcp-server.js";
+import { beforeEach, describe, expect, it } from "vitest";
+import { killAllServers } from "../../../src/modules/shared/server-registry.js";
+import { getTask, registerTask, removeTask } from "../../../src/modules/shared/task-registry.js";
+import { registerOpencodeCancelTask } from "../../../src/modules/tools/cancel_task.js";
+import { fixture, handler } from "../../helpers/v2.js";
 
-const clientForTaskMock = vi.fn();
-
-vi.mock("../../../src/modules/shared/opencode-client.js", () => ({
-  clientForTask: (...args: unknown[]) => clientForTaskMock(...args),
-}));
-
-const { registerOpencodeCancelTask } = await import("../../../src/modules/tools/cancel_task.js");
-const { getTask, registerTask, removeTask } = await import(
-  "../../../src/modules/shared/task-registry.js"
-);
-
-describe("opencode_cancel_task", () => {
-  beforeEach(() => {
-    clientForTaskMock.mockReset();
-    removeTask("task-1");
+const run = handler(registerOpencodeCancelTask);
+beforeEach(() => {
+  killAllServers();
+  removeTask("task_test");
+});
+function setup() {
+  const f = fixture();
+  registerTask({
+    taskId: "task_test",
+    serverId: "srv_test",
+    sessionId: "ses_test",
+    inputId: "msg_input",
   });
-
-  it("returns task_not_found when the task cannot be resolved", async () => {
-    clientForTaskMock.mockReturnValue(undefined);
-    const fake = createFakeMcpServer();
-    registerOpencodeCancelTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "missing" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        { type: "text", text: JSON.stringify({ task_id: "missing", status: "task_not_found" }) },
-      ],
+  return f;
+}
+describe("cancel v2 task", () => {
+  it("rejects unresolved task", async () =>
+    expect((await run({ task_id: "missing" })).status).toBe("task_not_found"));
+  it.each([
+    true,
+    false,
+  ])("interrupts without resuming and cancels only owned pending input (%s)", async (pending) => {
+    const { routes, fetch } = setup();
+    routes.set("GET /api/session/ses_test/inbox", {
+      data: pending ? [{ id: "other" }, { id: "msg_input" }] : [],
     });
+    routes.set("DELETE /api/session/ses_test/inbox/msg_input", 204);
+    expect((await run({ task_id: "task_test" })).status).toBe("cancelled");
+    expect(getTask("task_test")?.cancelledAt).toBeTypeOf("number");
+    expect(String(fetch.mock.calls[0][0])).toContain("resume=false");
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith("/inbox/other"))).toBe(false);
   });
-
-  it("aborts the session and returns cancelled status", async () => {
-    const abort = vi.fn().mockResolvedValue({});
-    clientForTaskMock.mockReturnValue({
-      client: { session: { abort } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeCancelTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1" });
-
-    expect(abort).toHaveBeenCalledWith({ path: { id: "session-1" } });
-    expect(result).toEqual({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            task_id: "task-1",
-            session_id: "session-1",
-            status: "cancelled",
-          }),
-        },
-      ],
-    });
+  it.each([401, 400])("does not mark cancellation on errors (%s)", async (status) => {
+    const { routes } = setup();
+    routes.set(
+      "POST /api/session/ses_test/interrupt",
+      status === 401 ? 401 : Response.json({ message: "invalid" }, { status }),
+    );
+    expect((await run({ task_id: "task_test" })).isError).toBe(true);
+    expect(getTask("task_test")?.cancelledAt).toBeUndefined();
   });
-
-  it("records cancelledAt on the registry record", async () => {
-    registerTask({ taskId: "task-1", serverId: "srv-1", sessionId: "session-1" });
-    clientForTaskMock.mockReturnValue({
-      client: { session: { abort: vi.fn().mockResolvedValue({}) } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeCancelTask(fake.server);
-
-    await fake.getHandler()({ task_id: "task-1" });
-
-    expect(getTask("task-1")?.cancelledAt).toBeTypeOf("number");
-    removeTask("task-1");
-  });
-
-  it("does not record cancelledAt when the abort itself fails", async () => {
-    registerTask({ taskId: "task-1", serverId: "srv-1", sessionId: "session-1" });
-    clientForTaskMock.mockReturnValue({
-      client: { session: { abort: vi.fn().mockRejectedValue(new Error("nope")) } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeCancelTask(fake.server);
-
-    await fake.getHandler()({ task_id: "task-1" });
-
-    expect(getTask("task-1")?.cancelledAt).toBeUndefined();
-    removeTask("task-1");
-  });
-
-  it("returns an error result when the SDK throws an Error", async () => {
-    clientForTaskMock.mockReturnValue({
-      client: { session: { abort: vi.fn().mockRejectedValue(new Error("db down")) } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeCancelTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ task_id: "task-1", status: "error", message: "db down" }),
-        },
-      ],
-    });
-  });
-
-  it("returns an error result when the SDK throws a non-Error value", async () => {
-    clientForTaskMock.mockReturnValue({
-      client: { session: { abort: vi.fn().mockRejectedValue("weird") } },
-      sessionId: "session-1",
-    });
-    const fake = createFakeMcpServer();
-    registerOpencodeCancelTask(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ task_id: "task-1" });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ task_id: "task-1", status: "error", message: "weird" }),
-        },
-      ],
-    });
-  });
+});
+it("does not race another task update", async () => {
+  setup();
+  Object.assign(getTask("task_test"), { mutating: true });
+  expect((await run({ task_id: "task_test" })).message).toBe("Another task update is in progress");
 });

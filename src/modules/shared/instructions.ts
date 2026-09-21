@@ -1,34 +1,18 @@
-import { formatTierGuide, formatUsageLimits, getUsageLimits } from "./usage-limits.js";
-
-const QUOTA_FALLBACK = `OpenCode Go usage limits — unavailable right now (the docs could not be fetched and no cached snapshot exists).
-All models share a single dollar budget per 5h / week / month, so an expensive model drains it in far fewer requests.`;
-
-/**
- * Build the MCP server instructions.
- *
- * Only the spend budget is embedded from the daily snapshot: per-model quotas
- * ride along with `opencode_list_agents`, keyed by the real model id, so they
- * are deliberately not repeated here.
- */
+/** Keep default model selection in OpenCode; retain the async initialization interface. */
 export async function createDelegateTaskInstructions(): Promise<string> {
-  const limits = await getUsageLimits();
-  const quotaBlock = limits ? formatUsageLimits(limits) : QUOTA_FALLBACK;
+  return `You have access to the opencode-mcp server, which lets you delegate work to OpenCode agents.
 
-  return `You have access to the opencode-mcp server, which lets you delegate work to OpenCode agents. Follow this workflow whenever you delegate tasks:
-
-${quotaBlock}
-Burning a scarce model on work a cheap model handles well is how a session runs out of budget in one shot. Default to the cheapest tier that can do the job and escalate only when the task actually demands it.
-
-Choosing a model — pass it per task via the optional "model" input of opencode_start_task as 'providerID/modelID'. Build that string only from opencode_list_agents output: models.providers[].provider + '/' + models.providers[].models[].id, both copied verbatim. Never derive an id from a model's display name, and never assume a provider prefix — read it from the same models.providers[] entry that supplied the id. If opencode_start_task returns status "unknown_model", pick one of the available_models it returns instead of retrying a guessed id.
-
-Every model in that output carries a quota field: per_5h (estimated requests per 5 hours) and tier. Choose by tier:
-${formatTierGuide()}
-Spread parallel tasks across models instead of firing every task at the same scarce one. models.providers[] is also the authority on what is actually enabled for the connected account.
+Model selection policy:
+- Omit the model parameter by default on both opencode_start_task and opencode_continue_task. Let OpenCode use the selected agent's configured model or its configured default model. For follow-ups, retain the session's current model.
+- Only provide model when the user explicitly requests a particular model or explicitly asks you to choose one. Task difficulty, price, quota metadata, or parallelism are not reasons to override the configured model on your own.
+- Do not copy a discovered default model ID into the model parameter: leave the parameter absent so OpenCode resolves its own configuration.
+- Omit agent when no specific agent is needed, letting OpenCode choose its default agent. Selecting an agent does not require selecting a model.
+- When an explicit model selection is authorized, build the ID from models.providers[].provider + '/' + models.providers[].models[].id, both copied verbatim from opencode_list_agents. Never guess an ID. If unknown_model is returned, report the mismatch instead of silently switching to another model.
 
 Workflow:
 1. Ensure an OpenCode server is running. If you don't already have a server_id from a previous opencode_start_server call, call opencode_start_server first.
-2. Call opencode_list_agents with the server_id to discover the available agents (native and custom), the exact model ids and their quotas. Agents may have a pre-assigned model ("provider/model"); you can still override it per task.
-3. For each task, call opencode_start_task with the server_id and the task's prompt, optionally with an agent name and/or a model override. Collect the returned task_id for every call.
+2. Use OpenCode defaults. Call opencode_list_agents only when you need to discover an agent, inspect capabilities, or resolve a model explicitly requested by the user. It is not a prerequisite for starting a task.
+3. For each task, call opencode_start_task with server_id and prompt. Omit model by default; omit agent when no specific agent is needed. Collect the returned task_id for every call.
 4. Wait for completion with opencode_wait_for_task:
    - Single task: mode "all" with the single task_id.
    - Multiple tasks, incremental results: call it repeatedly with mode "any", removing completed task_ids each time.

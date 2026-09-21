@@ -1,176 +1,49 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFakeMcpServer } from "../../../src/test-utils/fake-mcp-server.js";
+import { getServer, killAllServers } from "../../../src/modules/shared/server-registry.js";
+import { handler } from "../../helpers/v2.js";
 
-const createOpencodeServerMock = vi.fn();
-const createOpencodeClientMock = vi.fn();
-
-vi.mock("@opencode-ai/sdk", () => ({
-  createOpencodeServer: (...args: unknown[]) => createOpencodeServerMock(...args),
-  createOpencodeClient: (...args: unknown[]) => createOpencodeClientMock(...args),
+const mocks = vi.hoisted(() => ({ start: vi.fn(), responder: vi.fn() }));
+vi.mock("../../../src/modules/shared/opencode-server.js", () => ({
+  createOpencodeServer: mocks.start,
+}));
+vi.mock("../../../src/modules/shared/permissions.js", async (original) => ({
+  ...(await original()),
+  startPermissionResponder: mocks.responder,
 }));
 
-vi.mock("node:crypto", () => ({
-  randomUUID: () => "generated-uuid",
-}));
+import { registerOpencodeStartServer } from "../../../src/modules/tools/start_server.js";
 
-const getExternalDirectoryPolicyMock = vi.fn();
-const buildServerConfigMock = vi.fn();
-const startPermissionResponderMock = vi.fn();
-
-vi.mock("../../../src/modules/shared/permissions.js", () => ({
-  getExternalDirectoryPolicy: () => getExternalDirectoryPolicyMock(),
-  buildServerConfig: (...args: unknown[]) => buildServerConfigMock(...args),
-  startPermissionResponder: (...args: unknown[]) => startPermissionResponderMock(...args),
-}));
-
-const { registerOpencodeStartServer } = await import("../../../src/modules/tools/start_server.js");
-const { getServer, killAllServers } = await import(
-  "../../../src/modules/shared/server-registry.js"
-);
-
-describe("opencode_start_server", () => {
-  beforeEach(() => {
-    createOpencodeServerMock.mockReset();
-    createOpencodeClientMock.mockReset();
-    getExternalDirectoryPolicyMock.mockReset();
-    buildServerConfigMock.mockReset();
-    startPermissionResponderMock.mockReset();
-    killAllServers();
-
-    getExternalDirectoryPolicyMock.mockReturnValue("read-only");
-    buildServerConfigMock.mockReturnValue({ permission: { external_directory: "ask" } });
-    startPermissionResponderMock.mockReturnValue({ stop: vi.fn(), done: Promise.resolve() });
-    createOpencodeClientMock.mockReturnValue({ fake: "client" });
-  });
-
-  it("starts a server with the permission config, registers it, and returns its id", async () => {
+const run = handler(registerOpencodeStartServer);
+beforeEach(() => {
+  killAllServers();
+  vi.resetAllMocks();
+  mocks.responder.mockReturnValue({ stop: vi.fn() });
+});
+describe("private v2 server tool", () => {
+  it.each([undefined, 0, 5000])("registers one authenticated client (%s)", async (port) => {
     const close = vi.fn();
-    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close });
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ port: undefined });
-
-    expect(buildServerConfigMock).toHaveBeenCalledWith("read-only");
-    expect(createOpencodeServerMock).toHaveBeenCalledWith({
-      hostname: "127.0.0.1",
-      port: 4096,
-      config: { permission: { external_directory: "ask" } },
+    const client = {};
+    mocks.start.mockResolvedValue({ url: "http://127.0.0.1:4096", client, close });
+    const result = await run({ port });
+    expect(result.status).toBe("running");
+    expect(result.baseUrl).toBe("http://127.0.0.1:4096");
+    expect(getServer(result.server_id)?.client).toBe(client);
+    expect(mocks.start).toHaveBeenCalledWith({
+      port: port ?? 0,
+      config: { permissions: [{ action: "external_directory", resource: "*", effect: "ask" }] },
     });
-    expect(result).toEqual({
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({
-            server_id: "generated-uuid",
-            baseUrl: "http://127.0.0.1:4096",
-            status: "running",
-            permissions: { external_directory: "read-only", auto_approved: true },
-          }),
-        },
-      ],
-    });
-    expect(getServer("generated-uuid")).toMatchObject({
-      serverId: "generated-uuid",
-      baseUrl: "http://127.0.0.1:4096",
-    });
-  });
-
-  it("starts a permission responder bound to the new server's url", async () => {
-    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close: vi.fn() });
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-
-    await fake.getHandler()({ port: undefined });
-
-    expect(createOpencodeClientMock).toHaveBeenCalledWith({ baseUrl: "http://127.0.0.1:4096" });
-    expect(startPermissionResponderMock).toHaveBeenCalledWith(
-      { fake: "client" },
-      { policy: "read-only" },
-    );
-  });
-
-  it("stops the responder when the registered server is closed", async () => {
-    const close = vi.fn();
-    const stop = vi.fn();
-    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close });
-    startPermissionResponderMock.mockReturnValue({ stop, done: Promise.resolve() });
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-
-    await fake.getHandler()({ port: undefined });
+    const opts = mocks.responder.mock.calls[0][1];
+    opts.onError(new Error("secret"));
+    expect(getServer(result.server_id)?.permissionError).not.toContain("secret");
+    opts.onHealthy();
+    expect(getServer(result.server_id)?.permissionError).toBeUndefined();
     killAllServers();
-
-    expect(stop).toHaveBeenCalledOnce();
+    opts.onError(new Error("later"));
+    opts.onHealthy();
     expect(close).toHaveBeenCalledOnce();
   });
-
-  it("reports the resolved policy back to the caller", async () => {
-    getExternalDirectoryPolicyMock.mockReturnValue("deny");
-    buildServerConfigMock.mockReturnValue({ permission: { external_directory: "deny" } });
-    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:4096", close: vi.fn() });
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-
-    const result = await fake.getHandler()({ port: undefined });
-
-    expect(JSON.parse(result.content[0].text).permissions).toEqual({
-      external_directory: "deny",
-      auto_approved: true,
-    });
-  });
-
-  it("uses the provided port", async () => {
-    createOpencodeServerMock.mockResolvedValue({ url: "http://127.0.0.1:5000", close: vi.fn() });
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-    const handler = fake.getHandler();
-
-    await handler({ port: 5000 });
-
-    expect(createOpencodeServerMock).toHaveBeenCalledWith({
-      hostname: "127.0.0.1",
-      port: 5000,
-      config: { permission: { external_directory: "ask" } },
-    });
-  });
-
-  it("returns an error result when starting the server throws an Error", async () => {
-    createOpencodeServerMock.mockRejectedValue(new Error("boom"));
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ port: undefined });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ status: "error", message: "boom" }),
-        },
-      ],
-    });
-  });
-
-  it("returns an error result when starting the server throws a non-Error value", async () => {
-    createOpencodeServerMock.mockRejectedValue("string failure");
-    const fake = createFakeMcpServer();
-    registerOpencodeStartServer(fake.server);
-    const handler = fake.getHandler();
-
-    const result = await handler({ port: undefined });
-
-    expect(result).toEqual({
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ status: "error", message: "string failure" }),
-        },
-      ],
-    });
+  it.each([new Error("failed"), "failed"])("returns startup errors %s", async (error) => {
+    mocks.start.mockRejectedValue(error);
+    expect((await run({})).isError).toBe(true);
   });
 });

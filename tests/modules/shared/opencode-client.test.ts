@@ -1,510 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const createOpencodeClientMock = vi.fn();
-
-vi.mock("@opencode-ai/sdk", () => ({
-  createOpencodeClient: (...args: unknown[]) => createOpencodeClientMock(...args),
-}));
-
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   assistantEntries,
+  assistantEntry,
   buildProgress,
-  CANCELLED_TASK_MESSAGE,
   clientForServer,
   clientForTask,
   deriveTaskStatus,
-  EMPTY_TURN_MESSAGE,
   hasWork,
   lastAssistantEntry,
+  messages,
   PENDING_STALL_MS,
   sessionParts,
+  taskSnapshot,
 } from "../../../src/modules/shared/opencode-client.js";
-import { killAllServers, registerServer } from "../../../src/modules/shared/server-registry.js";
+import { getServer, killAllServers } from "../../../src/modules/shared/server-registry.js";
 import { registerTask, removeTask } from "../../../src/modules/shared/task-registry.js";
-
-describe("clientForServer", () => {
-  beforeEach(() => {
-    killAllServers();
-    createOpencodeClientMock.mockReset();
-  });
-
-  it("returns undefined when the server id is unknown", () => {
-    expect(clientForServer("missing")).toBeUndefined();
-    expect(createOpencodeClientMock).not.toHaveBeenCalled();
-  });
-
-  it("builds a client from the registered server's baseUrl", () => {
-    const fakeClient = { fake: true };
-    createOpencodeClientMock.mockReturnValue(fakeClient);
-    registerServer({ serverId: "srv-1", baseUrl: "http://127.0.0.1:4096", close: vi.fn() });
-
-    const client = clientForServer("srv-1");
-
-    expect(client).toBe(fakeClient);
-    expect(createOpencodeClientMock).toHaveBeenCalledWith({ baseUrl: "http://127.0.0.1:4096" });
-  });
-});
-
-describe("clientForTask", () => {
-  beforeEach(() => {
-    killAllServers();
-    createOpencodeClientMock.mockReset();
-    removeTask("task-1");
-  });
-
-  it("returns undefined when the task id is unknown", () => {
-    expect(clientForTask("missing")).toBeUndefined();
-  });
-
-  it("returns undefined when the task's server is unknown", () => {
-    registerTask({ taskId: "task-1", serverId: "srv-missing", sessionId: "session-1" });
-    expect(clientForTask("task-1")).toBeUndefined();
-  });
-
-  it("resolves the client and session id for a known task", () => {
-    const fakeClient = { fake: true };
-    createOpencodeClientMock.mockReturnValue(fakeClient);
-    registerServer({ serverId: "srv-1", baseUrl: "http://127.0.0.1:4096", close: vi.fn() });
-    registerTask({ taskId: "task-1", serverId: "srv-1", sessionId: "session-1" });
-
-    const resolved = clientForTask("task-1");
-
-    expect(resolved).toEqual({ client: fakeClient, sessionId: "session-1" });
-  });
-});
-
-describe("lastAssistantEntry", () => {
-  it("returns undefined when there are no messages", async () => {
-    const client = { session: { messages: vi.fn().mockResolvedValue({ data: [] }) } };
-    const entry = await lastAssistantEntry(client as never, "session-1");
-    expect(entry).toBeUndefined();
-  });
-
-  it("returns undefined when data is missing", async () => {
-    const client = { session: { messages: vi.fn().mockResolvedValue({}) } };
-    const entry = await lastAssistantEntry(client as never, "session-1");
-    expect(entry).toBeUndefined();
-  });
-
-  it("returns undefined when no message has the assistant role", async () => {
-    const client = {
-      session: {
-        messages: vi.fn().mockResolvedValue({
-          data: [{ info: { role: "user" }, parts: [] }],
-        }),
-      },
-    };
-    const entry = await lastAssistantEntry(client as never, "session-1");
-    expect(entry).toBeUndefined();
-  });
-
-  it("returns the most recent assistant message", async () => {
-    const olderAssistant = { info: { role: "assistant", id: "old" }, parts: [] };
-    const newestAssistant = { info: { role: "assistant", id: "new" }, parts: [{ type: "text" }] };
-    const client = {
-      session: {
-        messages: vi.fn().mockResolvedValue({
-          data: [olderAssistant, { info: { role: "user" }, parts: [] }, newestAssistant],
-        }),
-      },
-    };
-
-    const entry = await lastAssistantEntry(client as never, "session-1");
-
-    expect(entry).toEqual({ info: newestAssistant.info, parts: newestAssistant.parts });
-  });
-});
-
-describe("deriveTaskStatus", () => {
-  it("returns running when the session is busy", async () => {
-    const client = {
-      session: { status: vi.fn().mockResolvedValue({ data: { s1: { type: "busy" } } }) },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "running" });
-  });
-
-  it("returns running when the session is retrying", async () => {
-    const client = {
-      session: { status: vi.fn().mockResolvedValue({ data: { s1: { type: "retry" } } }) },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "running" });
-  });
-
-  it("returns cancelled for a cancelled task, even though the session says busy", async () => {
-    registerTask({
-      taskId: "task-killed",
-      serverId: "srv",
-      sessionId: "s1",
-      cancelledAt: Date.now(),
-    });
-    const client = {
-      session: { status: vi.fn().mockResolvedValue({ data: { s1: { type: "busy" } } }) },
-    };
-
-    const result = await deriveTaskStatus(client as never, "s1", "task-killed");
-
-    expect(result).toEqual({
-      task_id: "task-killed",
-      status: "cancelled",
-      error: CANCELLED_TASK_MESSAGE,
-      progress: undefined,
-    });
-    // Cancellation short-circuits before any session lookup.
-    expect(client.session.status).not.toHaveBeenCalled();
-    removeTask("task-killed");
-  });
-
-  it("returns cancelled instead of completed for an aborted finished session", async () => {
-    registerTask({
-      taskId: "task-killed",
-      serverId: "srv",
-      sessionId: "s1",
-      cancelledAt: Date.now(),
-    });
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant", time: { completed: 123 } },
-              parts: [{ type: "text", text: "half done" }],
-            },
-          ],
-        }),
-      },
-    };
-
-    const result = await deriveTaskStatus(client as never, "s1", "task-killed");
-
-    expect(result.status).toBe("cancelled");
-    removeTask("task-killed");
-  });
-
-  it("reports what a cancelled task managed to touch before the abort", async () => {
-    registerTask({
-      taskId: "task-killed",
-      serverId: "srv",
-      sessionId: "s1",
-      cancelledAt: Date.now(),
-    });
-    const client = {
-      session: {
-        status: vi.fn(),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant", time: { completed: 1 } },
-              parts: [
-                {
-                  type: "tool",
-                  tool: "write",
-                  state: { status: "completed", input: { filePath: "a.ts" } },
-                },
-              ],
-            },
-            { info: { role: "assistant", time: {} }, parts: [{ type: "text", text: "partial" }] },
-          ],
-        }),
-      },
-    };
-
-    const result = await deriveTaskStatus(client as never, "s1", "task-killed", {
-      includeProgress: true,
-    });
-
-    expect(result.status).toBe("cancelled");
-    expect(result.progress).toEqual({
-      text_snippet: "partial",
-      tool_calls_completed: 1,
-      mutating_tool_calls: 1,
-      files_touched: ["a.ts"],
-    });
-    removeTask("task-killed");
-  });
-
-  it("omits progress for a cancelled task with no assistant output", async () => {
-    registerTask({
-      taskId: "task-killed",
-      serverId: "srv",
-      sessionId: "s1",
-      cancelledAt: Date.now(),
-    });
-    const client = {
-      session: { status: vi.fn(), messages: vi.fn().mockResolvedValue({ data: [] }) },
-    };
-
-    const result = await deriveTaskStatus(client as never, "s1", "task-killed", {
-      includeProgress: true,
-    });
-
-    expect(result).toEqual({
-      task_id: "task-killed",
-      status: "cancelled",
-      error: CANCELLED_TASK_MESSAGE,
-      progress: undefined,
-    });
-    removeTask("task-killed");
-  });
-
-  it("returns pending when not busy and there is no assistant entry", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({ data: [] }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "pending" });
-  });
-
-  it("returns pending for a recently started task with no assistant entry", async () => {
-    registerTask({ taskId: "task-fresh", serverId: "srv", sessionId: "s1", createdAt: Date.now() });
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({ data: [] }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-fresh");
-    expect(result).toEqual({ task_id: "task-fresh", status: "pending" });
-    removeTask("task-fresh");
-  });
-
-  it("returns failed when an idle task has no assistant entry past the stall window", async () => {
-    registerTask({
-      taskId: "task-stalled",
-      serverId: "srv",
-      sessionId: "s1",
-      createdAt: Date.now() - PENDING_STALL_MS - 1,
-    });
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({ data: [] }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-stalled");
-    expect(result).toEqual({
-      task_id: "task-stalled",
-      status: "failed",
-      error:
-        "task produced no output after starting; the prompt was likely rejected (e.g. invalid model or agent)",
-    });
-    removeTask("task-stalled");
-  });
-
-  it("returns failed when the assistant entry has an error", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [{ info: { role: "assistant", error: { name: "OOPS" }, time: {} }, parts: [] }],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "failed", error: "OOPS" });
-  });
-
-  it("returns completed when the assistant entry finished and produced work", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant", time: { completed: 123 } },
-              parts: [{ type: "text", text: "all done" }],
-            },
-          ],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "completed", progress: undefined });
-  });
-
-  it("includes side-effect evidence on the completed path when includeProgress is true", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant", time: { completed: 123 } },
-              parts: [
-                { type: "text", text: "done" },
-                {
-                  type: "tool",
-                  tool: "write",
-                  state: { status: "completed", input: { filePath: "src/a.ts" } },
-                },
-              ],
-            },
-          ],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
-      includeProgress: true,
-    });
-    expect(result).toEqual({
-      task_id: "task-1",
-      status: "completed",
-      progress: {
-        text_snippet: "done",
-        tool_calls_completed: 1,
-        mutating_tool_calls: 1,
-        files_touched: ["src/a.ts"],
-      },
-    });
-  });
-
-  it("returns empty, not completed, when the finished turn produced nothing", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [{ info: { role: "assistant", time: { completed: 123 } }, parts: [] }],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({
-      task_id: "task-1",
-      status: "empty",
-      error: EMPTY_TURN_MESSAGE,
-      progress: undefined,
-    });
-  });
-
-  it("treats a whitespace-only finished turn as empty and can report its progress", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant", time: { completed: 123 } },
-              parts: [{ type: "text", text: "   \n  " }],
-            },
-          ],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
-      includeProgress: true,
-    });
-    expect(result).toEqual({
-      task_id: "task-1",
-      status: "empty",
-      error: EMPTY_TURN_MESSAGE,
-      progress: {
-        text_snippet: "   \n  ",
-        tool_calls_completed: 0,
-        mutating_tool_calls: 0,
-        files_touched: [],
-      },
-    });
-  });
-
-  it("returns running when the assistant entry has no completed time and no error", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [{ info: { role: "assistant", time: {} }, parts: [] }],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "running" });
-  });
-
-  it("does not call messages when includeProgress is false/absent on the busy path", async () => {
-    const messages = vi.fn();
-    const client = {
-      session: { status: vi.fn().mockResolvedValue({ data: { s1: { type: "busy" } } }), messages },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1");
-    expect(result).toEqual({ task_id: "task-1", status: "running" });
-    expect(messages).not.toHaveBeenCalled();
-  });
-
-  it("includes progress on the busy path when includeProgress is true", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: { s1: { type: "busy" } } }),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant" },
-              parts: [{ type: "text", text: "hello" }],
-            },
-          ],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
-      includeProgress: true,
-    });
-    expect(result).toEqual({
-      task_id: "task-1",
-      status: "running",
-      progress: {
-        text_snippet: "hello",
-        tool_calls_completed: 0,
-        mutating_tool_calls: 0,
-        files_touched: [],
-      },
-    });
-  });
-
-  it("omits progress on the busy path when there is no assistant entry yet", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: { s1: { type: "busy" } } }),
-        messages: vi.fn().mockResolvedValue({ data: [] }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
-      includeProgress: true,
-    });
-    expect(result).toEqual({ task_id: "task-1", status: "running", progress: undefined });
-  });
-
-  it("includes progress on the not-completed fallback path when includeProgress is true", async () => {
-    const client = {
-      session: {
-        status: vi.fn().mockResolvedValue({ data: {} }),
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            {
-              info: { role: "assistant", time: {} },
-              parts: [{ type: "text", text: "still working" }],
-            },
-          ],
-        }),
-      },
-    };
-    const result = await deriveTaskStatus(client as never, "s1", "task-1", {
-      includeProgress: true,
-    });
-    expect(result).toEqual({
-      task_id: "task-1",
-      status: "running",
-      progress: {
-        text_snippet: "still working",
-        tool_calls_completed: 0,
-        mutating_tool_calls: 0,
-        files_touched: [],
-      },
-    });
-  });
-});
+import { assistant, fixture, idle, user } from "../../helpers/v2.js";
 
 describe("buildProgress across a whole session", () => {
   it("reads the snippet from the latest turn and the evidence from every turn", () => {
@@ -547,31 +58,6 @@ describe("sessionParts", () => {
       { type: "text", text: "one" },
       { type: "text", text: "two" },
     ]);
-  });
-});
-
-describe("assistantEntries", () => {
-  it("returns every assistant message in order, skipping user messages", async () => {
-    const client = {
-      session: {
-        messages: vi.fn().mockResolvedValue({
-          data: [
-            { info: { role: "user" }, parts: [{ type: "text", text: "go" }] },
-            { info: { role: "assistant", time: { completed: 1 } }, parts: [] },
-            { info: { role: "assistant", time: { completed: 2 } }, parts: [] },
-          ],
-        }),
-      },
-    };
-    const entries = await assistantEntries(client as never, "s1");
-    expect(entries).toHaveLength(2);
-    expect(entries[0].info.time.completed).toBe(1);
-    expect(entries[1].info.time.completed).toBe(2);
-  });
-
-  it("returns an empty array when the session has no messages", async () => {
-    const client = { session: { messages: vi.fn().mockResolvedValue({ data: undefined }) } };
-    expect(await assistantEntries(client as never, "s1")).toEqual([]);
   });
 });
 
@@ -702,4 +188,208 @@ describe("buildProgress", () => {
       files_touched: [],
     });
   });
+});
+
+describe("v2 snapshots", () => {
+  beforeEach(() => {
+    killAllServers();
+    removeTask("task_test");
+  });
+  function task() {
+    registerTask({
+      taskId: "task_test",
+      serverId: "srv_test",
+      sessionId: "ses_test",
+      inputId: "msg_input",
+      createdAt: Date.now(),
+    });
+  }
+  it("reuses the authenticated client and resolves only registered tasks", () => {
+    const { client } = fixture();
+    expect(clientForServer("missing")).toBeUndefined();
+    expect(clientForTask("missing")).toBeUndefined();
+    task();
+    expect(clientForTask("task_test")).toEqual({ client, sessionId: "ses_test" });
+    killAllServers();
+    expect(clientForTask("task_test")).toBeUndefined();
+  });
+  it("reads ordered pages and rejects looping cursors", async () => {
+    const { client, fetch } = fixture();
+    fetch
+      .mockResolvedValueOnce(Response.json({ data: [user], cursor: { next: "next" } }))
+      .mockResolvedValueOnce(Response.json({ data: [assistant], cursor: {} }));
+    expect(await messages(client, "ses_test")).toHaveLength(2);
+    expect(String(fetch.mock.calls[1][0])).toContain("cursor=next");
+    expect(String(fetch.mock.calls[1][0])).not.toContain("order=");
+    fetch.mockImplementation(async () => Response.json({ data: [], cursor: { next: "same" } }));
+    await expect(messages(client, "ses_test")).rejects.toThrow("repeated");
+  });
+  it("normalizes content without treating streamed JSON as tool input", () => {
+    const content = [
+      { type: "reasoning", text: "thinking" },
+      ...["streaming", "running", "completed", "error"].map((status) => ({
+        type: "tool",
+        id: status,
+        name: "write",
+        state: { status, input: status === "streaming" ? "{" : { path: "/a" } },
+      })),
+    ];
+    const entry = assistantEntry({ ...assistant, content } as never);
+    expect(entry.parts[1]).toMatchObject({ state: { status: "pending", input: {} } });
+    expect(buildProgress(entry.parts).files_touched).toEqual(["/a"]);
+  });
+  it("collects assistant entries and handles empty timelines", async () => {
+    const { client, routes } = fixture();
+    expect(await assistantEntries(client, "ses_test")).toHaveLength(1);
+    expect((await lastAssistantEntry(client, "ses_test"))?.info.id).toBe("msg_answer");
+    routes.set("GET /api/session/ses_test/message", { data: [], cursor: {} });
+    expect(await lastAssistantEntry(client, "ses_test")).toBeUndefined();
+  });
+  it("reports completed output and optional progress", async () => {
+    const { client } = fixture();
+    task();
+    expect(await deriveTaskStatus(client, "ses_test", "task_test")).toMatchObject({
+      status: "completed",
+    });
+    expect(
+      await deriveTaskStatus(client, "ses_test", "task_test", { includeProgress: true }),
+    ).toMatchObject({ progress: { text_snippet: "done" } });
+  });
+  it("never reads an old completion as a newly submitted prompt", async () => {
+    const { client } = fixture();
+    task();
+    registerTask({
+      taskId: "task_test",
+      serverId: "srv_test",
+      sessionId: "ses_test",
+      inputId: "msg_new",
+      createdAt: Date.now(),
+    });
+    expect(await taskSnapshot(client, "ses_test", "task_test")).toMatchObject({
+      status: "pending",
+      result: null,
+    });
+  });
+  it("reports running until the whole execution is idle", async () => {
+    const { client, routes } = fixture();
+    task();
+    routes.set("GET /api/session/active", { data: { ses_test: { type: "running" } } });
+    expect(await taskSnapshot(client, "ses_test", "task_test")).toMatchObject({
+      status: "running",
+    });
+  });
+  it.each([
+    "failed",
+    "interrupted",
+    "succeeded",
+  ])("handles terminal %s with no assistant output", async (outcome) => {
+    const { client, routes } = fixture();
+    task();
+    routes.set("GET /api/session/ses_test/message", {
+      data: [user, { ...idle, outcome }],
+      cursor: {},
+    });
+    expect((await taskSnapshot(client, "ses_test", "task_test")).status).toBe(
+      outcome === "succeeded" ? "empty" : outcome === "failed" ? "failed" : "cancelled",
+    );
+  });
+  it("preserves execution failure details", async () => {
+    const { client, routes } = fixture();
+    task();
+    routes.set("GET /api/session/ses_test/message", {
+      data: [
+        user,
+        { ...assistant, error: { type: "provider", message: "failed" } },
+        { ...idle, outcome: "failed" },
+      ],
+      cursor: {},
+    });
+    expect(await taskSnapshot(client, "ses_test", "task_test")).toMatchObject({ error: "failed" });
+  });
+  it("keeps explicit cancellation and reports stalled inputs", async () => {
+    const { client, routes } = fixture();
+    task();
+    registerTask({
+      taskId: "task_test",
+      serverId: "srv_test",
+      sessionId: "ses_test",
+      inputId: "msg_input",
+      cancelledAt: 1,
+    });
+    expect((await taskSnapshot(client, "ses_test", "task_test")).status).toBe("cancelled");
+    routes.set("GET /api/session/ses_test/message", { data: [user], cursor: {} });
+    registerTask({
+      taskId: "task_test",
+      serverId: "srv_test",
+      sessionId: "ses_test",
+      inputId: "msg_input",
+      createdAt: Date.now() - PENDING_STALL_MS - 1,
+    });
+    expect((await taskSnapshot(client, "ses_test", "task_test")).status).toBe("failed");
+    expect((await taskSnapshot(client, "ses_test", "unknown")).status).toBe("pending");
+  });
+  it("surfaces unhealthy permission handling", async () => {
+    const { client } = fixture();
+    task();
+    Object.assign(getServer("srv_test"), { permissionError: "unavailable" });
+    await expect(taskSnapshot(client, "ses_test", "task_test")).rejects.toThrow("unavailable");
+  });
+});
+
+it.each([
+  { idleAt: 3, previousIdleAt: 0, expected: "cancelled" },
+  { idleAt: 3, previousIdleAt: 3, expected: "pending" },
+  { idleAt: 0, previousIdleAt: 0, expected: "pending" },
+])("uses a fresh session terminal timestamp without an idle message: %o", async ({
+  idleAt,
+  previousIdleAt,
+  expected,
+}) => {
+  const { client, routes } = fixture();
+  registerTask({
+    taskId: "terminal_test",
+    serverId: "srv_test",
+    sessionId: "ses_test",
+    inputId: "msg_input",
+    previousIdleAt,
+  });
+  routes.set("GET /api/session/ses_test/message", { data: [user, assistant], cursor: {} });
+  routes.set("GET /api/session/ses_test", {
+    data: { id: "ses_test", outcome: "interrupted", time: { idle: idleAt } },
+  });
+  expect((await taskSnapshot(client, "ses_test", "terminal_test")).status).toBe(expected);
+  removeTask("terminal_test");
+});
+it("accepts a first-run terminal timestamp without a previous baseline", async () => {
+  const { client, routes } = fixture();
+  registerTask({
+    taskId: "first_run",
+    serverId: "srv_test",
+    sessionId: "ses_test",
+    inputId: "msg_input",
+  });
+  routes.set("GET /api/session/ses_test/message", { data: [user, assistant], cursor: {} });
+  routes.set("GET /api/session/ses_test", {
+    data: { id: "ses_test", outcome: "succeeded", time: { idle: 3 } },
+  });
+  expect((await taskSnapshot(client, "ses_test", "first_run")).status).toBe("completed");
+  removeTask("first_run");
+});
+it("recognizes permission rejection without session outcome or idle projection", async () => {
+  const { client, routes } = fixture();
+  registerTask({
+    taskId: "rejected",
+    serverId: "srv_test",
+    sessionId: "ses_test",
+    inputId: "msg_input",
+  });
+  routes.set("GET /api/session/ses_test/message", {
+    data: [user, { ...assistant, error: { type: "aborted", message: "Step interrupted" } }],
+    cursor: {},
+  });
+  expect(await taskSnapshot(client, "ses_test", "rejected")).toMatchObject({
+    status: "cancelled",
+    error: "Step interrupted",
+  });
+  removeTask("rejected");
 });

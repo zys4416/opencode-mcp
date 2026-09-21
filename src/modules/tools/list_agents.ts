@@ -1,6 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { Agent, Provider } from "@opencode-ai/sdk";
-import { createOpencodeClient } from "@opencode-ai/sdk";
+import type { AgentInfo } from "@opencode/client";
 import { z } from "zod";
 import { jsonError, jsonResult } from "../shared/mcp-result.js";
 import { getServer } from "../shared/server-registry.js";
@@ -15,24 +14,18 @@ import {
 
 interface AgentSummary {
   name: string;
-  mode: Agent["mode"];
+  mode: AgentInfo["mode"];
   description?: string;
   /** Pre-assigned model as "provider/model"; can still be overridden per task. */
   model?: string;
 }
 
-// Current opencode servers report the built-in flag as `native`; the SDK types
-// still declare the older `builtIn` field, so check both.
-function isNativeAgent(agent: Agent): boolean {
-  return (agent as Agent & { native?: boolean }).native ?? agent.builtIn ?? false;
-}
-
-function toAgentSummary(agent: Agent): AgentSummary {
+function toAgentSummary(agent: AgentInfo): AgentSummary {
   return {
-    name: agent.name,
+    name: agent.id,
     mode: agent.mode,
     ...(agent.description ? { description: agent.description } : {}),
-    ...(agent.model ? { model: `${agent.model.providerID}/${agent.model.modelID}` } : {}),
+    ...(agent.model ? { model: `${agent.model.providerID}/${agent.model.id}` } : {}),
   };
 }
 
@@ -41,14 +34,6 @@ interface ModelSummary {
   id: string;
   /** OpenCode Go quota for this model, or `null` when the docs list none. */
   quota: { per_5h: number | null; tier: QuotaTier } | null;
-}
-
-function toProviderSummary(provider: Provider, quotas: Map<string, ModelQuota>) {
-  return {
-    provider: provider.id,
-    name: provider.name,
-    models: Object.keys(provider.models).map((id) => toModelSummary(id, quotas.get(id))),
-  };
 }
 
 function toModelSummary(id: string, quota: ModelQuota | undefined): ModelSummary {
@@ -76,7 +61,7 @@ export function registerOpencodeListAgents(server: McpServer) {
     "opencode_list_agents",
     {
       description:
-        "List agents (native and custom) and available models/providers on an OpenCode server instance",
+        "Inspect available agents and enabled models/providers. Optional discovery, not required for default-model tasks. Catalog and quota metadata do not authorize overriding OpenCode defaults.",
       inputSchema: {
         server_id: z.string().describe("Id of the server instance to query"),
       },
@@ -88,35 +73,41 @@ export function registerOpencodeListAgents(server: McpServer) {
       }
 
       try {
-        const client = createOpencodeClient({ baseUrl: instance.baseUrl });
+        const client = instance.client;
+        const location = { directory: instance.directory };
         // getUsageLimits() reads a once-a-day snapshot from disk, so this adds
         // no network round-trip on a warm cache and never throws.
-        const [agentsResult, providersResult, limits] = await Promise.all([
-          client.app.agents(),
-          client.config.providers(),
-          getUsageLimits(),
-        ]);
-
-        const failure = agentsResult.error ?? providersResult.error;
-        if (failure) {
-          return jsonError({ server_id, status: "error", message: errorMessage(failure) });
-        }
-
-        const allAgents = agentsResult.data ?? [];
-        const providers = providersResult.data?.providers ?? [];
-        const defaults = providersResult.data?.default ?? {};
+        const [agentsResult, providersResult, modelsResult, defaultResult, limits] =
+          await Promise.all([
+            client.agent.list({ location }),
+            client.provider.list({ location }),
+            client.model.list({ location }),
+            client.model.default({ location }),
+            getUsageLimits(),
+          ]);
+        const allAgents = agentsResult.data.filter((agent) => !agent.hidden);
+        const models = modelsResult.data.filter((model) => model.enabled);
+        const defaults = defaultResult.data
+          ? { [defaultResult.data.providerID]: defaultResult.data.id }
+          : {};
         const quotas = limits ? quotaByModelId(limits) : new Map<string, ModelQuota>();
-
         return jsonResult({
           server_id,
           agents: {
-            native: allAgents.filter(isNativeAgent).map(toAgentSummary),
-            custom: allAgents.filter((a) => !isNativeAgent(a)).map(toAgentSummary),
+            native: [],
+            custom: [],
+            available: allAgents.map(toAgentSummary),
           },
           models: {
             defaults,
             quota_snapshot: toQuotaSnapshot(limits),
-            providers: providers.map((provider) => toProviderSummary(provider, quotas)),
+            providers: providersResult.data.map((provider) => ({
+              provider: provider.id,
+              name: provider.name,
+              models: models
+                .filter((model) => model.providerID === provider.id)
+                .map((model) => toModelSummary(model.id, quotas.get(model.id))),
+            })),
           },
         });
       } catch (error) {

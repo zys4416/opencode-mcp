@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Releases before `1.2.0` predate this file and are not documented here.
 
+## [Unreleased]
+
+OpenCode v2 preview (`2.0.0-dev.0`) in the [zys4416 fork](https://github.com/zys4416/opencode-mcp).
+The upstream npm package is not updated by this fork.
+
+### Changed
+
+- Target **OpenCode 2.0.11** with `@opencode/client@2.0.11`; require Node.js 22+.
+  Other binary versions are rejected before starting a child process.
+- Start private `opencode serve --stdio` instances using the JSON startup handshake,
+  authenticated health/PID checks, and one shared authenticated client per instance.
+- Allocate a free port by default (`port: 0`). Explicit nonzero ports remain strict;
+  a conflict does not attach to or stop an existing service.
+- Prefer OpenCode's configured model. Instructions and tool descriptions tell the
+  host to omit `model` unless the user requests model selection. Discovery is optional;
+  quota metadata no longer drives automatic overrides. The parameter remains available.
+- Migrate task submission, model/agent selection, cancellation, message pagination,
+  permission events and replies to the native v2 API.
+
+### Fixed
+
+- Prevent follow-ups from reporting an earlier input's completed result. Correlate
+  each input with its own messages and execution outcome; reset cancellation on continuation.
+- Recognize permission-rejected executions that omit session terminal fields and
+  idle messages, once the execution is inactive and the current input has an assistant error.
+- Treat `empty` and `cancelled` as terminal in multi-task waits. Interrupt without
+  resuming queued work and remove only the task's own pending input.
+- Reconcile missed permission events through polling, expose responder failures,
+  and avoid auto-approving unrelated CLI sessions. Preserve external read-only decisions.
+- Reject concurrent updates to the same task and clean up failed or stopped private servers.
+
+### Added
+
+- Shared-password CLI observation through `OPENCODE_PASSWORD` (legacy alias:
+  `OPENCODE_SERVER_PASSWORD`), or private random credentials when neither is set.
+  Credentials are not returned in tool results or forwarded in child logs.
+- `OPENCODE_BIN` for selecting the local OpenCode executable.
+- Independent installation instructions using a tarball, production dependencies,
+  version directories and a `current` link; the source checkout is not needed at runtime.
+- Native-client HTTP-contract tests and an isolated real-binary integration test
+  using a loopback model fixture, including live events and CLI observation.
+
+### Compatibility notes
+
+- `agents.available` is authoritative. v2 does not expose native/custom provenance,
+  so the retained `agents.native` and `agents.custom` arrays are empty.
+- Progress is scoped to the current input and all its assistant turns, rather than
+  all previous follow-ups. Result retrieval can include partial text and uses the
+  same status snapshot as status polling; terminal diagnostics use `error`.
+- Explicit model/agent changes on continuation persist as session settings.
+- Only private `serve` instances are supported; shared background-service attachment
+  and MCP task-ID recovery after restart are not implemented.
+- Reconnect the MCP host after changing its installation. Existing sessions with an
+  explicit model selection are not automatically reset by the default-first policy.
+
 ## [1.2.0] — 2026-08-28
 
 Delegated tasks could hang forever, or report `completed` after doing nothing.
